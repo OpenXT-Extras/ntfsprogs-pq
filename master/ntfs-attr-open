@@ -1,0 +1,13 @@
+diff --git a/libntfs/attrib.c b/libntfs/attrib.c
+index 54dbd36..07d71cb 100644
+--- a/libntfs/attrib.c
++++ b/libntfs/attrib.c
+@@ -370,7 +370,7 @@ ntfs_attr *ntfs_attr_open(ntfs_inode *ni, const ATTR_TYPES type,
+ 
+ 		tmp_na = list_entry(pos, ntfs_attr, list_entry);
+ 		if (tmp_na->type == type && tmp_na->name_len == name_len &&
+-				!ntfs_ucsncmp(tmp_na->name, name, name_len)) {
++		    (!name_len || !ntfs_ucsncmp(tmp_na->name, name, name_len))) {
+ 			ntfs_log_trace("Found this attribute in cache, "
+ 					"increment reference count and "
+ 					"return it.\n");

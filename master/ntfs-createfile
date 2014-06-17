@@ -1,0 +1,106 @@
+diff --git a/include/ntfs/dir.h b/include/ntfs/dir.h
+index 615bff2..6c332ee 100644
+--- a/include/ntfs/dir.h
++++ b/include/ntfs/dir.h
+@@ -76,6 +76,7 @@ extern ntfs_inode *ntfs_create_device(ntfs_inode *dir_ni,
+ 		ntfschar *name, u8 name_len, dev_t type, dev_t dev);
+ extern ntfs_inode *ntfs_create_symlink(ntfs_inode *dir_ni,
+ 		ntfschar *name, u8 name_len, ntfschar *target, u8 target_len);
++extern ntfs_inode *ntfs_createfile(ntfs_volume *vol, const char *filepath);
+ 
+ extern int ntfs_delete(ntfs_inode **pni, ntfs_inode *dir_ni, ntfschar *name,
+ 		u8 name_len);
+diff --git a/libntfs/dir.c b/libntfs/dir.c
+index 58cbf1d..d8beaa6 100644
+--- a/libntfs/dir.c
++++ b/libntfs/dir.c
+@@ -1803,3 +1803,89 @@ err_out:
+ 	return -1;
+ }
+ 
++/**
++ * Create a regular file under the given directory inode
++ *
++ * It is a wrapper function to ntfs_create(...)
++ *
++ * Return:  the created file inode
++ */
++static ntfs_inode *ntfs_new_file(ntfs_inode *dir_ni, const char *filename)
++{
++	ntfschar *ufilename  = NULL;
++	ntfs_inode *ni = NULL;
++	int ufilename_len;
++
++	/* ntfs_mbstoucs() will allocate memory for ufilename if it's NULL */
++	ufilename_len = ntfs_mbstoucs(filename, &ufilename, 0);
++
++	if (ufilename_len == -1) {
++		ntfs_log_perror("Failed to convert '%s' to unicode", filename);
++	} else {
++		ni = ntfs_create(dir_ni, ufilename, ufilename_len, S_IFREG);
++		free(ufilename);
++	}
++
++	return ni;
++}
++
++/**
++ * Create a regular file with only one path
++ *
++ * Return:  the created file inode
++ */
++ntfs_inode *ntfs_createfile(ntfs_volume *vol, const char *filepath)
++{
++	ntfs_inode *ni = NULL;
++	ntfs_inode *parent_ni;
++	char *path;
++
++	/* split the name up after duplicating it */
++	path = strdup(filepath);
++
++	if (path == NULL) {
++		ntfs_log_error("Out of memory.\n");
++		errno = ENOMEM;
++	} else {
++		char *s1;
++		char *s2;
++		char *p1 = NULL;
++		char *parent;
++		char *child;
++
++		/* figure out the file name based on the last "/" or "\" */
++		s1 = strrchr(path, '\\');
++		s2 = strrchr(path, '/');
++
++		if ((s1 != NULL) && (s2 == NULL))
++			p1 = s1;
++		else if ((s2 != NULL) && (s1 == NULL))
++			p1 = s2;
++		else if ((s1 != NULL) && (s2 != NULL))
++			p1 = (s1 > s2) ? s1 : s2;
++
++		if (p1 != NULL) {
++			/* the name is split up between parent and child */
++			*p1 = '\0';
++			p1++;
++
++			child = p1;
++			parent = path;
++		} else {
++			/* there is no separator so we only have the child */
++			child = path;
++			parent = NULL;
++		}
++
++		parent_ni = ntfs_pathname_to_inode(vol, NULL, parent);
++
++		if (parent_ni) {
++			ni = ntfs_new_file(parent_ni, child);
++			ntfs_inode_close(parent_ni);
++		}
++
++		free(path);
++	}
++
++	return ni;
++}

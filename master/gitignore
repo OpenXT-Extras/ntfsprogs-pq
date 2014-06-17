@@ -1,0 +1,76 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..31e1cbc
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,70 @@
++# autotools side-effects
++configure
++configure.lineno
++config.guess
++config.h.in
++config.sub
++install-sh
++missing
++compile
++config.h
++*.log
++*.status
++stamp-h*
++.stamp_*
++libtool
++depcomp
++ltmain.sh
++m4/*
++autom4te.cache/*
++autom4te.cache/
++INSTALL
++install-sh
++ltmain.sh
++Makefile
++Makefile.in
++doc/Makefile.in
++include/Makefile.in
++include/ntfs/Makefile.in
++libntfs/Makefile.in
++ntfsprogs/Makefile.in
++test/Makefile.in
++libntfs/.deps/
++libntfs/.deps/*
++libntfs/.libs/
++libntfs/.libs/*
++libntfs/libntfs.la
++libntfs/libntfs.so*
++libntfs/libntfs_la-*
++ntfsprogs/.deps/
++ntfsprogs/.deps/*
++ntfsprogs/.libs/
++ntfsprogs/.libs/*
++ntfsprogs/*.o
++test/.deps/
++test/.deps/*
++aclocal.m4
++
++# emacs
++*~
++
++# libntfs
++libntfs/*.8
++libntfs/*.conf
++ntfsprogs/*.8
++ntfsprogs/mkntfs
++ntfsprogs/ntfscat
++ntfsprogs/ntfsclone
++ntfsprogs/ntfscluster
++ntfsprogs/ntfscmp
++ntfsprogs/ntfscp
++ntfsprogs/ntfsfix
++ntfsprogs/ntfsinfo
++ntfsprogs/ntfslabel
++ntfsprogs/ntfsls
++ntfsprogs/ntfsmount
++ntfsprogs/ntfsresize
++ntfsprogs/ntfsundelete
++ntfsprogs/ntfsutil
++
++TAGS

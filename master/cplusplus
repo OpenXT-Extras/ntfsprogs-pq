@@ -1,0 +1,24 @@
+diff --git a/include/ntfs/attrib.h b/include/ntfs/attrib.h
+index b20e0ff..6aab6b9 100644
+--- a/include/ntfs/attrib.h
++++ b/include/ntfs/attrib.h
+@@ -231,7 +231,8 @@ static inline int NAttr##func_name(ntfs_attr *na)			\
+ static inline void NAttrSet##func_name(ntfs_attr *na)			\
+ {									\
+ 	if (na->type == AT_DATA && na->name == AT_UNNAMED)		\
+-		na->ni->flags |= FILE_ATTR_##flag;			\
++		na->ni->flags = (FILE_ATTR_FLAGS)			\
++			((u32)na->ni->flags | FILE_ATTR_##flag);	\
+ 	else								\
+ 		ntfs_log_trace("BUG! Should be called only for "	\
+ 				"unnamed data attribute.\n");		\
+@@ -239,7 +240,8 @@ static inline void NAttrSet##func_name(ntfs_attr *na)			\
+ static inline void NAttrClear##func_name(ntfs_attr *na)			\
+ {									\
+ 	if (na->type == AT_DATA && na->name == AT_UNNAMED)		\
+-		na->ni->flags &= ~FILE_ATTR_##flag;			\
++		na->ni->flags =	(FILE_ATTR_FLAGS)			\
++			((u32)na->ni->flags & ~FILE_ATTR_##flag);	\
+ }
+ 
+ GenNAttrIno(Compressed, COMPRESSED)

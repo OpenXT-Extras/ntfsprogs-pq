@@ -1,0 +1,618 @@
+diff --git a/libntfs/dir.c b/libntfs/dir.c
+index 58cbf1d..b841113 100644
+--- a/libntfs/dir.c
++++ b/libntfs/dir.c
+@@ -1613,11 +1613,13 @@ search:
+ 		ntfs_index_entry_mark_dirty(ictx);
+ 	}
+ 	/* Do not support reparse point deletion yet. */
++	/*
+ 	if (((FILE_NAME_ATTR*)ictx->data)->file_attributes &
+ 			FILE_ATTR_REPARSE_POINT) {
+ 		errno = EOPNOTSUPP;
+ 		goto err_out;
+ 	}
++	*/
+ 	/* Remove FILE_NAME from index. */
+ 	if (ntfs_index_rm(ictx))
+ 		goto err_out;
+diff --git a/ntfsprogs/Makefile.am b/ntfsprogs/Makefile.am
+index f3088e0..40365c1 100644
+--- a/ntfsprogs/Makefile.am
++++ b/ntfsprogs/Makefile.am
+@@ -100,7 +100,8 @@ ntfscmp_SOURCES		= ntfscmp.c utils.c utils.h
+ ntfscmp_LDADD		= $(AM_LIBS)
+ ntfscmp_LDFLAGS		= $(AM_LFLAGS)
+ 
+-ntfsutil_SOURCES        = ntfsutil.c ntfsutil.h ntfsutil-lib.c ntfsutil-lib.h utils.c utils.h
++ntfsutil_SOURCES        = ntfsutil.c ntfsutil.h ntfsutil-lib.c ntfsutil-lib.h utils.c utils.h \
++			  ntfsutil-rm.c
+ ntfsutil_LDADD          = $(AM_LIBS)
+ ntfsutil_LDFLAGS        = $(AM_LFLAGS)
+ 
+diff --git a/ntfsprogs/ntfsutil-rm.c b/ntfsprogs/ntfsutil-rm.c
+new file mode 100644
+index 0000000..64e06de
+--- /dev/null
++++ b/ntfsprogs/ntfsutil-rm.c
+@@ -0,0 +1,544 @@
++/*
++ * ntfsutil-rm
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program (in the main directory of the Linux-NTFS
++ * distribution in the file COPYING); if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include "config.h"
++
++#ifdef HAVE_STDIO_H
++#include <stdio.h>
++#endif
++#ifdef HAVE_GETOPT_H
++#include <getopt.h>
++#endif
++#ifdef HAVE_STDLIB_H
++#include <stdlib.h>
++#endif
++#ifdef HAVE_SYS_STAT_H
++#include <sys/stat.h>
++#endif
++#ifdef HAVE_STRING_H
++#include <string.h>
++#endif
++
++#include <libgen.h>
++#include <signal.h>
++#include <fnmatch.h>
++
++#include "types.h"
++#include "attrib.h"
++#include "dir.h"
++#include "utils.h"
++#include "volume.h"
++#include "ntfsutil.h"
++#include "ntfsutil-lib.h"
++
++struct ntfsutil_rm_ctx {
++	struct ntfsutil_rm_options   opts;
++	struct ntfsutil_target       tgt;
++	const char                  *filter;
++};
++
++struct ntfsutil_dirent {
++	struct list_head             list;
++	char                         name[MAX_PATH];
++};
++
++static volatile sig_atomic_t caught_terminate;
++
++static int ntfsutil_rm_path(struct ntfsutil_rm_ctx *, const char *);
++
++/**
++ * usage - Print a list of the parameters to the program
++ *
++ * Print a list of the parameters and options for the program.
++ *
++ * Return:  none
++ */
++static void
++usage(const char *app)
++{
++	ntfs_log_info("\nUsage: %s image:path [options]\n\n"
++		"    -r, --recursive            Remove subdirectories\n"
++		"    -i, --interactive          Prompt before deleting\n"
++		"    -s, --system               Remove system files\n"
++		"    -f, --force                Disable prompts\n"
++		"    -F, --force-mount          Force mounting dirty vols\n"
++		"    -V, --version              Print version\n"
++		"    -h, --help                 Print this message\n"
++		"    --log-{progress,quiet,verbose,trace,debug}\n\n", app);
++}
++
++/**
++ * parse_options - Read and validate the programs command line
++ *
++ * Read the command line, verify the syntax and parse the options.
++ * This function is very long, but quite simple.
++ *
++ * returns 0 if application should proceed, 1 otherwise, errno set on failure
++ */
++static int
++parse_options(struct ntfsutil_rm_options *opts, int argc, char **argv)
++{
++	static const char *sopt = "-risfFVh?";
++	static const struct option lopt[] = {
++		{ "recursive",	    no_argument,	NULL, 'r' },
++		{ "interactive",    no_argument,	NULL, 'i' },
++		{ "system",	    no_argument,	NULL, 's' },
++		{ "force",          no_argument,        NULL, 'f' },
++		{ "force-mount",    no_argument,        NULL, 'F' },
++		{ "version",        no_argument,        NULL, 'V' },
++		{ "help",           no_argument,        NULL, 'h' },
++		{ NULL,		    0,			NULL,  0  },
++	};
++
++	int c, err, help, version;
++
++	err     = 0;
++	help    = 0;
++	version = 0;
++
++	optind  = 0;
++	opterr  = 0;
++
++	ntfs_log_clear_levels(NTFS_LOG_LEVEL_PROGRESS);
++
++	while ((c = getopt_long(argc, argv, sopt, lopt, NULL)) != -1) {
++		switch (c) {
++		case 1:	/* A non-option argument */
++			if (!opts->tgt)
++				opts->tgt = argv[optind - 1];
++			else {
++				ntfs_log_error("You must specify exactly one "
++					       "target.\n");
++				err = 1;
++			}
++			break;
++		case 'r':
++			opts->recursive = 1;
++			break;
++		case 'i':
++			opts->interactive = 1;
++			break;
++		case 's':
++			opts->system = 1;
++			break;
++		case 'f':
++			opts->force = 1;
++			break;
++		case 'F':
++			opts->force_mount = 1;
++			break;
++		case 'V':
++			version = 1;
++			break;
++		case 'h':
++		case '?':
++			if (!strncmp(argv[optind - 1], "--log-", 6)) {
++				if (!strcmp(argv[optind - 1], "--log-progress"))
++					ntfs_log_set_levels(NTFS_LOG_LEVEL_PROGRESS);
++				else if (!ntfs_log_parse_option(argv[optind - 1]))
++					err = 1;
++				break;
++			}
++			help = 1;
++			break;
++		default:
++			ntfs_log_error("Unknown option '%s'.\n", argv[optind-1]);
++			err = 1;
++			break;
++		}
++	}
++
++	if (!help && !version) {
++		if (opts->interactive) {
++			ntfs_log_error("interactive mode not yet implemented\n");
++			err = 1;
++		} else if (!opts->tgt) {
++			ntfs_log_error("You must specify a target.\n");
++			err = 1;
++		}
++	}
++
++	if (help || version || err) {
++		ntfs_log_set_levels(NTFS_LOG_LEVEL_VERBOSE);
++		if (version)
++			ntfsutil_version();
++		if (help || err)
++			usage(argv[0]);
++		errno = (err ? EINVAL : 0);
++		err = 1;
++	}
++
++	return err;
++}
++
++static int
++ntfsutil_fnmatch(struct ntfsutil_rm_ctx *ctx, const char *path)
++{
++	if (!ctx->filter)
++		return 0;
++	return fnmatch(ctx->filter, path, 0);
++}
++
++/**
++ * signal_handler - Handle SIGINT and SIGTERM: abort write, sync and exit.
++ */
++static void
++signal_handler(int arg __attribute__((unused)))
++{
++	caught_terminate++;
++}
++
++static int
++ntfsutil_rm_readdir(void *private, const ntfschar *name, const int name_len,
++		    const int name_type, const s64 pos __attribute__((unused)),
++		    const MFT_REF mref, const unsigned dt_type)
++{
++	int ret;
++	char *filename;
++	struct list_head *head;
++	struct ntfsutil_dirent *entry;
++
++	ret      = 1;
++	entry    = NULL;
++	filename = NULL;
++	head     = (struct list_head *)private;
++
++	if (ntfs_ucstombs(name, name_len, &filename, MAX_PATH) < 0) {
++		filename = NULL;
++		ntfs_log_perror("converting direntry");
++		goto out;
++	}
++
++	if (!strcmp(filename, ".") || !strcmp(filename, ".."))
++		goto done;
++
++	entry = ntfs_calloc(sizeof(*entry));
++	if (!entry)
++		goto out;
++
++	INIT_LIST_HEAD(&entry->list);
++	sprintf(entry->name, "%s", filename);
++	list_add_tail(&entry->list, head);
++
++done:
++	ret = 0;
++out:
++	free(filename);
++	return ret;
++}
++
++static int
++ntfsutil_rm_directory_contents(struct ntfsutil_rm_ctx *ctx,
++			       ntfs_inode *idir, const char *dir_path)
++{
++	int ret;
++	s64 pos;
++	char *del;
++	struct ntfsutil_dirent *entry;
++	struct list_head head, *itr, *tmp;
++
++	ret = 1;
++	pos = 0;
++	del = (dir_path[strlen(dir_path) - 1] == '/' ? "" : "/");
++	INIT_LIST_HEAD(&head);
++
++	if (ntfs_readdir(idir, &pos, &head, ntfsutil_rm_readdir)) {
++		ntfs_log_perror("reading directory %s", dir_path);
++		goto out;
++	}
++
++	list_for_each(itr, &head) {
++		char *path;
++
++		if (caught_terminate) {
++			ntfs_log_error("SIGTERM or SIGINT received.  "
++				       "Aborting copy.\n");
++			ret = 1;
++			goto out;
++		}
++
++		entry = list_entry(itr, struct ntfsutil_dirent, list);
++		ret = asprintf(&path, "%s%s%s", dir_path, del, entry->name);
++		if (ret == -1) {
++			errno = ENOMEM;
++			goto out;
++		}
++
++		ret = ntfsutil_rm_path(ctx, path);
++		free(path);
++
++		if (ret)
++			goto out;
++	}
++
++	ret = 0;
++
++out:
++	list_for_each_safe(itr, tmp, &head) {
++		entry = list_entry(itr, struct ntfsutil_dirent, list);
++		list_del(&entry->list);
++		free(entry);
++	}
++
++	return ret;
++}
++
++static int
++ntfsutil_rm_path(struct ntfsutil_rm_ctx *ctx, const char *path)
++{
++	ntfschar *uname;
++	char *dir, *name;
++	ntfs_inode *idir, *iname;
++	int ret, match, uname_len;
++
++	ret    = 1;
++	dir    = NULL;
++	name   = NULL;
++	uname  = NULL;
++	idir   = NULL;
++	iname  = NULL;
++
++	ntfs_log_trace("Entering: %s\n", path);
++
++	if (ntfsutil_path_split(path, &dir, &name))
++		goto out;
++
++	match = ntfsutil_fnmatch(ctx, path);
++	if (match == FNM_NOMATCH)
++		goto done;
++	else if (match) {
++		errno = match;
++		goto out;
++	}
++
++	idir = ntfs_pathname_to_inode(ctx->tgt.vol, NULL, dir);
++	if (!idir) {
++		ntfs_log_perror("Failed opening %s", dir);
++		goto out;
++	}
++
++	/*
++	 * ntfs_delete() removes both WIN32 and DOS filenames,
++	 * so if we can't open a path returned from readdir()
++	 * we've already deleted it.
++	 */
++	iname = ntfs_pathname_to_inode(ctx->tgt.vol, idir, name);
++	if (!iname) {
++		if (errno == ENOENT) {
++			errno = 0;
++			goto done;
++		}
++		ntfs_log_perror("Failed opening %s", path);
++		goto out;
++	}
++
++	if (iname->mft_no < FILE_first_user && !ctx->opts.system) {
++		ret = 0;
++		ntfs_log_verbose("Omitting system file %s\n", path);
++		goto out;
++	}
++
++	if (iname->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
++		if (!ctx->opts.recursive) {
++			ntfs_log_info("Omitting directory %s\n", path);
++			goto done;
++		}
++
++		if (ntfs_check_empty_dir(iname)) {
++			if (errno == ENOTEMPTY && !ctx->opts.force) {
++				ntfs_log_error("%s not empty\n", path);
++				goto out;
++			} else if (errno != ENOTEMPTY) {
++				ntfs_log_perror("checking directory");
++				goto out;
++			}
++		}
++
++		ret = ntfsutil_rm_directory_contents(ctx, iname, path);
++		if (ret)
++			goto out;
++	}
++
++	ntfs_log_progress("Removing %s (0x%llx)\n", path, MREF(iname->mft_no));
++
++	uname = ntfs_str2ucs(name, &uname_len);
++	if (!uname) {
++		ntfs_log_perror("allocating uname");
++		goto out;
++	}
++
++	if ((ret = ntfs_delete(&iname, idir, uname, uname_len))) {
++		ntfs_log_perror("removing %s", name);
++		goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	free(dir);
++	free(name);
++	free(uname);
++	if (idir)
++		ntfs_inode_close(idir);
++	if (iname)
++		ntfs_inode_close(iname);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++static int
++ntfsutil_start_rm(struct ntfsutil_rm_ctx *ctx)
++{
++	int ret;
++	char *dir;
++	ntfs_inode *ni;
++
++	ret  = 1;
++	dir  = NULL;
++	ni   = NULL;
++
++	if (ctx->filter) {
++		/*
++		 * when working with filters, we need to start in the dir
++		 * of the first path element without a wildcard
++		 *
++		 * TODO: handle arbitry wildcard placement
++		 * (rather than just at end of path)
++		 */
++		if (ntfsutil_path_split(ctx->tgt.path, &dir, NULL))
++			goto out;
++
++		ni = ntfs_pathname_to_inode(ctx->tgt.vol, NULL, dir);
++		if (!ni) {
++			ntfs_log_perror("opening target %s", dir);
++			goto out;
++		}
++
++		ret = ntfsutil_rm_directory_contents(ctx, ni, dir);
++		goto out;
++	}
++
++	ni = ntfs_pathname_to_inode(ctx->tgt.vol, NULL, ctx->tgt.path);
++	if (!ni) {
++		ntfs_log_perror("opening %s", ctx->tgt.path);
++		goto out;
++	}
++
++	ntfs_inode_close(ni);
++	ni = NULL;
++
++	ret = ntfsutil_rm_path(ctx, ctx->tgt.path);
++
++out:
++	free(dir);
++	if (ni)
++		ntfs_inode_close(ni);
++	return ret;
++}
++
++/**
++ * _ntfsutil_rm() - remove ntfs files
++ *
++ * returns 0 on success or 1 on failure with errno set
++ */
++int
++_ntfsutil_rm(struct ntfsutil_rm_options *opts)
++{
++	int ret, i, n, flags;
++	struct ntfsutil_rm_ctx ctx;
++
++	ret = 1;
++
++	memset(&ctx, 0, sizeof(ctx));
++	memcpy(&ctx.opts, opts, sizeof(*opts));
++
++	ntfs_log_trace("Entering.\n");
++
++	if (ntfsutil_parse_target(ctx.opts.tgt, &ctx.tgt)) {
++		ntfs_log_error("failed parsing target %s\n", ctx.opts.tgt);
++		goto out;
++	}
++
++	if (!ctx.tgt.image || !ctx.tgt.path) {
++		errno = EINVAL;
++		ntfs_log_perror("target must have from image:path");
++		goto out;
++	}
++
++	n = strlen(ctx.tgt.path);
++	for (i = 0; i < n; i++) {
++		if (strchr("*[]?", ctx.tgt.path[i])) {
++			ctx.filter = ctx.tgt.path;
++			break;
++		}
++	}
++
++	/* Set SIGINT handler. */
++	if (signal(SIGINT, signal_handler) == SIG_ERR) {
++		ntfs_log_perror("Failed to set SIGINT handler");
++		goto out;
++	}
++	/* Set SIGTERM handler. */
++	if (signal(SIGTERM, signal_handler) == SIG_ERR) {
++		ntfs_log_perror("Failed to set SIGTERM handler");
++		goto out;
++	}
++
++	flags = (ctx.opts.force_mount ? NTFS_MNT_FORCE : 0);
++	ctx.tgt.vol = utils_mount_volume(ctx.tgt.image, flags);
++	if (!ctx.tgt.vol) {
++		ntfs_log_perror("failed mounting %s", ctx.tgt.image);
++		goto out;
++	}
++
++	ret = ntfsutil_start_rm(&ctx);
++
++out:
++	if (ctx.tgt.vol)
++		ntfs_umount(ctx.tgt.vol, FALSE);
++	free(ctx.tgt.image);
++	free(ctx.tgt.path);
++
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++/**
++ * ntfsutil_rm() - parse command line options and return _ntfsutil_rm()
++ */
++int
++ntfsutil_rm(int argc, char *argv[])
++{
++	int ret;
++	struct ntfsutil_rm_options opts;
++
++	ret = 1;
++	memset(&opts, 0, sizeof(opts));
++
++	if (parse_options(&opts, argc, argv)) {
++		if (!errno)
++			ret = 0;
++		goto out;
++	}
++
++	ret = _ntfsutil_rm(&opts);
++
++out:
++	return ret;
++}
+diff --git a/ntfsprogs/ntfsutil.c b/ntfsprogs/ntfsutil.c
+index 05a962e..e459b6e 100644
+--- a/ntfsprogs/ntfsutil.c
++++ b/ntfsprogs/ntfsutil.c
+@@ -47,7 +47,9 @@ struct command {
+ 	ntfsutil_func_t         func;
+ };
+ 
+-static struct command commands[] = { };
++static struct command commands[] = {
++	{ .name = "rm",        .func = ntfsutil_rm },
++};
+ 
+ /**
+  * version - Print version information about the program
+diff --git a/ntfsprogs/ntfsutil.h b/ntfsprogs/ntfsutil.h
+index c0957ba..e8162dd 100644
+--- a/ntfsprogs/ntfsutil.h
++++ b/ntfsprogs/ntfsutil.h
+@@ -24,4 +24,16 @@
+ 
+ typedef int (*ntfsutil_func_t)(int, char **);
+ 
++struct ntfsutil_rm_options {
++	char		            *tgt;         /* Target volume:path */
++	int                          recursive;   /* Recursive copy */
++	int                          interactive; /* Prompt before deleting */
++	int                          system;      /* Remove system files */
++	int                          force;       /* Disable prompts */
++	int                          force_mount; /* Mount dirty volumes */
++};
++
++int ntfsutil_rm(int, char **);
++int _ntfsutil_rm(struct ntfsutil_rm_options *);
++
+ #endif /* _NTFSUTIL_H_ */

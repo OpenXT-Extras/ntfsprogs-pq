@@ -1,0 +1,165 @@
+diff --git a/ntfsprogs/ntfsinfo.c b/ntfsprogs/ntfsinfo.c
+index 6a30cb2..3baf7e1 100644
+--- a/ntfsprogs/ntfsinfo.c
++++ b/ntfsprogs/ntfsinfo.c
+@@ -79,6 +79,7 @@
+ #include "ntfstime.h"
+ #include "version.h"
+ #include "support.h"
++#include "reparse.h"
+ 
+ static const char *EXEC_NAME = "ntfsinfo";
+ 
+@@ -1866,9 +1867,141 @@ static void ntfs_dump_attr_bitmap(ATTR_RECORD *attr __attribute__((unused)))
+  *
+  * of ntfs 3.x dumps the reparse_point attribute
+  */
+-static void ntfs_dump_attr_reparse_point(ATTR_RECORD *attr __attribute__((unused)))
++static void ntfs_dump_attr_reparse_point(ntfs_inode *inode)
+ {
+-	/* TODO */
++	int size;
++	le16 data_length;
++	REPARSE_POINT *rp;
++
++	size = ntfs_get_ntfs_reparse_data(NULL, NULL, 0, inode);
++	if (size < 0) {
++		ntfs_log_perror("getting reparse point size");
++		return;
++	}
++
++	rp = ntfs_malloc(size);
++	if (!rp) {
++		errno = ENOMEM;
++		ntfs_log_perror("malloc reparse_point");
++		return;
++	}
++
++	size = ntfs_get_ntfs_reparse_data(NULL, (char *)rp, size, inode);
++	if (size < 0) {
++		ntfs_log_perror("reading reparse point");
++		free(rp);
++		return;
++	}
++
++	data_length = le16_to_cpu(rp->reparse_data_length);
++
++	printf("tag                       0x%08x\n", le32_to_cpu(rp->reparse_tag));
++	printf("data length               0x%04x\n", data_length);
++	printf("reserved                  0x%04x\n", le16_to_cpu(rp->reserved));
++
++	switch (rp->reparse_tag) {
++	case IO_REPARSE_TAG_MOUNT_POINT: {
++		struct MOUNT_POINT_REPARSE_DATA *mp =
++			(struct MOUNT_POINT_REPARSE_DATA *)rp->reparse_data;
++		ntfschar *md = (ntfschar *)((char *)mp +
++					    sizeof(struct MOUNT_POINT_REPARSE_DATA));
++		le16 sno = le16_to_cpu(mp->subst_name_offset);
++		le16 snl = le16_to_cpu(mp->subst_name_length);
++		le16 pno = le16_to_cpu(mp->print_name_offset);
++		le16 pnl = le16_to_cpu(mp->print_name_length);
++
++		printf("subst_name_offset         0x%04x\n", sno);
++		printf("subst_name_length         0x%04x\n", snl);
++		printf("print_name_offset         0x%04x\n", pno);
++		printf("print_name_length         0x%04x\n", pnl);
++
++		if (sno >= 0 && snl > 0 && sno + snl < data_length) {
++			char *sn = NULL;
++			ntfschar *sp = md + (sno / sizeof(ntfschar));
++
++			if (ntfs_ucstombs(sp, snl / sizeof(ntfschar), &sn, 0) == -1) {
++				ntfs_log_perror("converting substitute name\n");
++				goto out;
++			}
++
++			printf("subst_name                %s\n", sn);
++			free(sn);
++		} else {
++			printf("subst_name invalid\n");
++		}
++
++		if (pno >= 0 && pnl > 0 && pno + pnl < data_length) {
++			char *pn = NULL;
++			ntfschar *pp = md + (pno / sizeof(ntfschar));
++
++			if (ntfs_ucstombs(pp, pnl / sizeof(ntfschar), &pn, 0) == -1) {
++				ntfs_log_perror("converting print name\n");
++				goto out;
++			}
++
++			printf("print_name                %s\n", pn);
++			free(pn);
++		} else {
++			printf("print_name invalid\n");
++		}
++		break;
++	}
++
++	case IO_REPARSE_TAG_SYMLINK: {
++		struct SYMLINK_REPARSE_DATA *sl =
++			(struct SYMLINK_REPARSE_DATA *)rp->reparse_data;
++		ntfschar *sd = (ntfschar *)((char *)sl +
++					    sizeof(struct SYMLINK_REPARSE_DATA));
++		le16 sno = le16_to_cpu(sl->subst_name_offset);
++		le16 snl = le16_to_cpu(sl->subst_name_length);
++		le16 pno = le16_to_cpu(sl->print_name_offset);
++		le16 pnl = le16_to_cpu(sl->print_name_length);
++		le32 flg = le32_to_cpu(sl->flags);
++
++		printf("subst_name_offset         0x%04x\n", sno);
++		printf("subst_name_length         0x%04x\n", snl);
++		printf("print_name_offset         0x%04x\n", pno);
++		printf("print_name_length         0x%04x\n", pnl);
++		printf("flags                     0x%08x\n", flg);
++
++		if (sno >= 0 && snl > 0 && sno + snl < data_length) {
++			char *sn = NULL;
++			ntfschar *sp = sd + (sno / sizeof(ntfschar));
++
++			if (ntfs_ucstombs(sp, snl / sizeof(ntfschar), &sn, 0) == -1) {
++				ntfs_log_perror("converting substitute name\n");
++				goto out;
++			}
++
++			printf("subst_name                %s\n", sn);
++			free(sn);
++		} else {
++			printf("subst_name invalid\n");
++		}
++
++		if (pno >= 0 && pnl > 0 && pno + pnl < data_length) {
++			char *pn = NULL;
++			ntfschar *pp = sd + (pno / sizeof(ntfschar));
++
++			if (ntfs_ucstombs(pp, pnl / sizeof(ntfschar), &pn, 0) == -1) {
++				ntfs_log_perror("converting print name\n");
++				goto out;
++			}
++
++			printf("print_name                %s\n", pn);
++			free(pn);
++		} else {
++			printf("print_name invalid\n");
++		}
++		break;
++	}
++
++	default:
++		printf("unsupported reparse point type\n");
++	}
++
++out:
++	free(rp);
+ }
+ 
+ /**
+@@ -2196,7 +2329,7 @@ static void ntfs_dump_file_attributes(ntfs_inode *inode)
+ 			ntfs_dump_attr_bitmap(ctx->attr);
+ 			break;
+ 		case AT_REPARSE_POINT:
+-			ntfs_dump_attr_reparse_point(ctx->attr);
++			ntfs_dump_attr_reparse_point(inode);
+ 			break;
+ 		case AT_EA_INFORMATION:
+ 			ntfs_dump_attr_ea_information(ctx->attr);

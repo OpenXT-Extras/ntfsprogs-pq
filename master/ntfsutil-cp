@@ -1,0 +1,2642 @@
+diff --git a/ntfsprogs/Makefile.am b/ntfsprogs/Makefile.am
+index c1f069b..755629b 100644
+--- a/ntfsprogs/Makefile.am
++++ b/ntfsprogs/Makefile.am
+@@ -104,7 +104,8 @@ ntfsutil_SOURCES        = ntfsutil.c ntfsutil.h ntfsutil-lib.c ntfsutil-lib.h ut
+ 			  ntfsutil-rm.c \
+ 			  ntfsutil-mkdir.c \
+ 			  ntfsutil-reparse.c \
+-			  ntfsutil-dump.c
++			  ntfsutil-dump.c \
++			  ntfsutil-cp.c
+ ntfsutil_LDADD          = $(AM_LIBS)
+ ntfsutil_LDFLAGS        = $(AM_LFLAGS)
+ 
+diff --git a/ntfsprogs/ntfsutil-cp.c b/ntfsprogs/ntfsutil-cp.c
+new file mode 100644
+index 0000000..b56d9d9
+--- /dev/null
++++ b/ntfsprogs/ntfsutil-cp.c
+@@ -0,0 +1,2583 @@
++/*
++ * ntfsutil-cp
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program (in the main directory of the Linux-NTFS
++ * distribution in the file COPYING); if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include "config.h"
++
++#ifdef HAVE_STDIO_H
++#include <stdio.h>
++#endif
++#ifdef HAVE_GETOPT_H
++#include <getopt.h>
++#endif
++#ifdef HAVE_STDLIB_H
++#include <stdlib.h>
++#endif
++#ifdef HAVE_SYS_STAT_H
++#include <sys/stat.h>
++#endif
++#ifdef HAVE_STRING_H
++#include <string.h>
++#endif
++
++#include <libgen.h>
++#include <signal.h>
++#include <fnmatch.h>
++
++#include "types.h"
++#include "attrib.h"
++#include "utils.h"
++#include "volume.h"
++#include "dir.h"
++#include "index.h"
++#include "reparse.h"
++#include "security.h"
++#include "ntfstime.h"
++#include "ntfsutil.h"
++#include "ntfsutil-lib.h"
++
++//#define NTFSUTIL_CP_SECURE_SDS
++
++struct ntfsutil_cp_inos {
++	u64                                src;
++	u64                                dst;
++	FILE_ATTR_FLAGS                    flags;
++};
++
++struct ntfsutil_cp_ino_map {
++	u64                                cnt;
++	u64                                capacity;
++	struct ntfsutil_cp_inos           *inos;
++};
++
++struct ntfsutil_cp_ctx {
++	struct ntfsutil_cp_options         opts;
++	struct ntfsutil_cp_ino_map         ino_map;
++	struct ntfsutil_target             src;
++	struct ntfsutil_target             dst;
++	const char                        *filter;
++};
++
++struct ntfsutil_dirent {
++	struct list_head                   list;
++	char                               name[MAX_PATH];
++};
++
++static volatile sig_atomic_t caught_terminate;
++
++static int ntfsutil_cp_path(struct ntfsutil_cp_ctx *,
++			    const char *, const char *, const char *);
++
++/**
++ * usage - Print a list of the parameters to the program
++ *
++ * Print a list of the parameters and options for the program.
++ *
++ * Return:  none
++ */
++static void
++usage(const char *app)
++{
++	ntfs_log_info("\nUsage: %s src:path dst:path [options]\n\n"
++		"    -r, --recursive            Copy subdirectories\n"
++		"    -i, --interactive          Warn on clobber\n"
++		"    -s, --system               Copy system files\n"
++		"    -p, --preserve             Preserve metadata\n"
++	        "    -P, --preserve-reparse     Preserve reparse points\n"
++		"    -u, --update-reparse       Update reprse points\n"
++		"    -c, --copy-reparse         Copy external reparse points\n"
++	        "    -I, --identifier           Reparse volume identifier\n"
++		"    -f, --force                Delete existing dst files\n"
++		"    -F, --force-mount          Force mounting dirty vols\n"
++		"    -V, --version              Print version\n"
++		"    -h, --help                 Print this message\n"
++		"    --log-{progress,quiet,verbose,trace,debug}\n\n", app);
++}
++
++/**
++ * parse_options - Read and validate the programs command line
++ *
++ * Read the command line, verify the syntax and parse the options.
++ * This function is very long, but quite simple.
++ *
++ * returns 0 if application should proceed, 1 otherwise, errno set on failure
++ */
++static int
++parse_options(struct ntfsutil_cp_options *opts, int argc, char **argv)
++{
++	static const char *sopt = "-rispPucI:fFVh?";
++	static const struct option lopt[] = {
++		{ "recursive",	    	no_argument,		NULL, 'r' },
++		{ "interactive",    	no_argument,		NULL, 'i' },
++		{ "system",	    	no_argument,		NULL, 's' },
++		{ "preserve",	    	no_argument,		NULL, 'p' },
++		{ "preserve-reparse",	no_argument,        	NULL, 'P' },
++		{ "update-reparse", 	no_argument,        	NULL, 'u' },
++		{ "copy-reparse",   	no_argument,        	NULL, 'c' },
++		{ "identifier",        	required_argument,  	NULL, 'I' },
++		{ "force",          	no_argument,        	NULL, 'f' },
++		{ "force-mount",    	no_argument,        	NULL, 'F' },
++		{ "version",        	no_argument,        	NULL, 'V' },
++		{ "help",           	no_argument,        	NULL, 'h' },
++		{ NULL,		    	0,			NULL,  0  },
++	};
++
++	int c, err, help, version;
++
++	err     = 0;
++	help    = 0;
++	version = 0;
++
++	optind  = 0;
++	opterr  = 0;
++
++	ntfs_log_clear_levels(NTFS_LOG_LEVEL_PROGRESS);
++
++	while ((c = getopt_long(argc, argv, sopt, lopt, NULL)) != -1) {
++		switch (c) {
++		case 1:	/* A non-option argument */
++			if (!opts->src)
++				opts->src = argv[optind - 1];
++			else if (!opts->dst)
++				opts->dst = argv[optind - 1];
++			else {
++				ntfs_log_error("You must specify exactly one "
++					       "source and one destination.\n");
++				err = 1;
++			}
++			break;
++		case 'r':
++			opts->recursive = 1;
++			break;
++		case 'i':
++			opts->interactive = 1;
++			break;
++		case 's':
++			opts->system = 1;
++			break;
++		case 'p':
++			opts->preserve = 1;
++			break;
++		case 'P':
++			opts->reparse_preserve = 1;
++			break;
++		case 'u':
++			opts->reparse_update = 1;
++			break;
++		case 'c':
++			opts->reparse_copy = 1;
++			break;
++		case 'I':
++			opts->vol_id = optarg;
++			break;
++		case 'f':
++			opts->force = 1;
++			break;
++		case 'F':
++			opts->force_mount = 1;
++			break;
++		case 'V':
++			version = 1;
++			break;
++		case 'h':
++		case '?':
++			if (!strncmp(argv[optind - 1], "--log-", 6)) {
++				if (!strcmp(argv[optind - 1], "--log-progress"))
++					ntfs_log_set_levels(NTFS_LOG_LEVEL_PROGRESS);
++				else if (!ntfs_log_parse_option(argv[optind - 1]))
++					err = 1;
++				break;
++			}
++			help = 1;
++			break;
++		default:
++			ntfs_log_error("Unknown option '%s'.\n", argv[optind-1]);
++			err = 1;
++			break;
++		}
++	}
++
++	if (opts->reparse_copy)
++		opts->reparse_update = 1;
++
++	if (!help && !version) {
++		if (opts->interactive || opts->force) {
++			ntfs_log_error("Interactive and force modes "
++				       "not yet implemented\n");
++			err = 1;
++		} else if (!opts->src) {
++			ntfs_log_error("You must specify a source.\n");
++			err = 1;
++		} else if (!opts->dst) {
++			ntfs_log_error("You must specify a destination.\n");
++			err = 1;
++		} else if (opts->reparse_preserve && opts->reparse_update) {
++			ntfs_log_error("the --preserve-reparse and "
++				       "--update-reparse options are "
++				       "mutually exclusive.\n");
++			err = 1;
++		} else if ((opts->reparse_update || opts->reparse_copy)
++			   && !opts->vol_id) {
++			ntfs_log_error("You must supply the volume identifier "
++				       "to update or copy reparse points\n");
++			err = 1;
++		} else if (opts->vol_id) {
++			int bad_id = 0;
++			char *p = opts->vol_id;
++
++			if (strlen(p) == 2) {
++				if (p[0] < 'A' || p[0] > 'Z' || p[1] != ':')
++					bad_id = 1;
++			} else if (strlen(p) == 45) {
++				if (strstr(p, "Volume{") != p ||
++				    p[strlen(p) - 1] != '}')
++					bad_id = 1;
++			} else
++				bad_id = 1;
++
++			if (bad_id) {
++				ntfs_log_error("volume identifier should have "
++					       "form '[A-Z]:' or "
++					       "'Volume{uuid}'\n");
++				err = 1;
++			}
++		}
++	}
++
++	if (help || version || err) {
++		ntfs_log_set_levels(NTFS_LOG_LEVEL_VERBOSE);
++		if (version)
++			ntfsutil_version();
++		if (help || err)
++			usage(argv[0]);
++		errno = (err ? EINVAL : 0);
++		err = 1;
++	}
++
++	return err;
++}
++
++static int
++ntfsutil_cp_map_initialize(struct ntfsutil_cp_ctx *ctx)
++{
++	memset(&ctx->ino_map, 0, sizeof(ctx->ino_map));
++	return 0;
++}
++
++static int
++ntfsutil_cp_map_free(struct ntfsutil_cp_ctx *ctx)
++{
++	free(ctx->ino_map.inos);
++	return 0;
++}
++
++static int
++ntfsutil_cp_map_inos(struct ntfsutil_cp_ctx *ctx,
++		     ntfs_inode *isrc, ntfs_inode *idst)
++{
++	int ret;
++	struct ntfsutil_cp_ino_map *map;
++
++	ret = 1;
++	map = &ctx->ino_map;
++
++	if (map->cnt == map->capacity) {
++		u64 capacity = (map->capacity ? map->capacity * 2 : 100);
++		u64 size = capacity * sizeof(struct ntfsutil_cp_inos);
++		struct ntfsutil_cp_inos *inos = realloc(map->inos, size);
++		if (!inos) {
++			errno = ENOMEM;
++			goto out;
++		}
++		map->inos = inos;
++		map->capacity = capacity;
++	}
++
++	map->inos[map->cnt].src   = isrc->mft_no;
++	map->inos[map->cnt].dst   = idst->mft_no;
++	map->inos[map->cnt].flags = isrc->flags;
++	map->cnt++;
++
++	ret = 0;
++
++out:
++	return ret;
++}
++
++static int
++ntfsutil_fnmatch(struct ntfsutil_cp_ctx *ctx, const char *path)
++{
++	if (!ctx->filter)
++		return 0;
++	return fnmatch(ctx->filter, path, 0);
++}
++
++/**
++ * signal_handler - Handle SIGINT and SIGTERM: abort write, sync and exit.
++ */
++static void
++signal_handler(int arg __attribute__((unused)))
++{
++	caught_terminate++;
++}
++
++static int
++ntfsutil_cp_circular(struct ntfsutil_cp_ctx *ctx,
++		     ntfs_inode *isrc, ntfs_inode *idst)
++{
++	if (ctx->src.vol != ctx->dst.vol)
++		return 0;
++
++	/*
++	 * TODO: walk chain from root to idst checking for
++	 * mft_no == isrc at every node.
++	 */
++	return 0;
++}
++
++static int
++ntfsutil_cp_hardlink(struct ntfsutil_cp_ctx *ctx,
++		     ntfs_inode *isrc, u64 *dst_ino)
++{
++	int i, ret;
++	struct ntfsutil_cp_ino_map *map;
++
++	ret      = 0;
++	map      = &ctx->ino_map;
++	*dst_ino = (u64)-1;
++
++	if (le16_to_cpu(isrc->mrec->link_count) == 1)
++		goto out;
++
++	for (i = map->cnt - 1; i >= 0; i--) {
++		if (map->inos[i].src == isrc->mft_no) {
++			*dst_ino = map->inos[i].dst;
++			ret = 1;
++			goto out;
++		}
++	}
++
++out:
++	return ret;
++}
++
++static void
++ntfsutil_copy_filename_bits(FILE_NAME_ATTR *dst, FILE_NAME_ATTR *src)
++{
++	dst->creation_time           = src->creation_time;
++	dst->last_data_change_time   = src->last_data_change_time;
++	dst->last_mft_change_time    = src->last_mft_change_time;
++	dst->last_access_time        = src->last_access_time;
++	dst->file_name_type          = src->file_name_type;
++
++	/*
++	 * we do not create compressed files, since libntfs
++	 * doesn't support writing to them.
++	 */
++	dst->file_attributes         = (src->file_attributes &
++					~FILE_ATTR_COMPRESSED);
++}
++
++/**
++ * ntfsutil_new_dirent() - create a new directory entry in @idst_dir
++ *
++ * TODO: the new name is given by @udst, but the file_name_type is taken
++ * frmo @isrc->file_name and @isrc_dir->entry->file_name, meaning that
++ * @udst should really be checked against file_name_type namespace restrictions
++ */
++static int
++ntfsutil_new_dirent(struct ntfsutil_cp_ctx *ctx,
++		    ntfschar *usrc, int usrc_len,
++		    ntfschar *udst, int udst_len,
++		    ntfs_inode *isrc_dir, ntfs_inode *isrc,
++		    ntfs_inode *idst_dir, ntfs_inode *idst)
++{
++	int r, ret, fn_len;
++	ntfs_index_context *sictx;
++	ntfs_attr_search_ctx *sactx;
++	FILE_NAME_ATTR *sdfn, *sfn, *fn;
++
++	ret   = 1;
++	fn    = NULL;
++	sfn   = NULL;
++	sdfn  = NULL;
++	sictx = NULL;
++	sactx = NULL;
++
++	ntfs_log_trace("creating new dirent in 0x%llx to 0x%llx\n",
++		       idst_dir->mft_no, idst->mft_no);
++
++	/*
++	 * find src dirent
++	 */
++	sictx = ntfs_index_ctx_get(isrc_dir, NTFS_INDEX_I30, 4);
++	if (!sictx) {
++		ntfs_log_perror("getting src index ctx");
++		goto out;
++	}
++
++	while (!(r = ntfs_index_iterate_next(sictx))) {
++
++		sdfn = (FILE_NAME_ATTR *)&sictx->entry->key;
++		if (usrc_len == sdfn->file_name_length &&
++		    isrc_dir->mft_no == MREF_LE(sdfn->parent_directory) &&
++		    !ntfs_ucsncmp(usrc, sdfn->file_name, usrc_len))
++			break;
++
++		sdfn = NULL;
++	}
++
++	if (r || !sdfn) {
++		if (!r)
++			errno = ENOENT;
++		ntfs_log_perror("finding src dirent");
++		goto out;
++	}
++
++	/*
++	 * find src file_name attr
++	 */
++	sactx = ntfs_attr_get_search_ctx(isrc, NULL);
++	if (!sactx) {
++		ntfs_log_perror("getting src attr ctx");
++		goto out;
++	}
++
++	while (!(r = ntfs_attrs_walk(sactx))) {
++
++		if (sactx->attr->type != AT_FILE_NAME)
++			continue;
++
++		sfn = (FILE_NAME_ATTR *)
++			((u8 *)sactx->attr +
++			 le16_to_cpu(sactx->attr->value_offset));
++		if (usrc_len == sfn->file_name_length &&
++		    isrc_dir->mft_no == MREF_LE(sfn->parent_directory) &&
++		    !ntfs_ucsncmp(usrc, sfn->file_name, usrc_len))
++			break;
++
++		sfn = NULL;
++	}
++
++	if (r || !sfn) {
++		if (!r)
++			errno = ENOENT;
++		ntfs_log_perror("finding src file name");
++		goto out;
++	}
++
++	/*
++	 * add dst file_name attr
++	 */
++	fn_len = sizeof(FILE_NAME_ATTR) + udst_len * sizeof(ntfschar);
++	fn = ntfs_calloc(fn_len);
++	if (!fn) {
++		ntfs_log_perror("allocating new file name");
++		goto out;
++	}
++
++	ntfsutil_copy_filename_bits(fn, sfn);
++	memcpy(fn->file_name, udst, udst_len * sizeof(ntfschar));
++	fn->file_name_length = udst_len;
++	fn->parent_directory = MK_LE_MREF(
++		idst_dir->mft_no,
++		le16_to_cpu(idst_dir->mrec->sequence_number));
++
++	if (ntfs_attr_add(idst, AT_FILE_NAME,
++			  AT_UNNAMED, 0, (u8 *)fn, fn_len)) {
++		ntfs_log_perror("adding file name attr");
++		goto out;
++	}
++
++	/*
++	 * add dst dirent
++	 */
++	ntfsutil_copy_filename_bits(fn, sdfn);
++	memcpy(fn->file_name, udst, udst_len * sizeof(ntfschar));
++	fn->file_name_length = udst_len;
++	fn->parent_directory = MK_LE_MREF(
++		idst_dir->mft_no,
++		le16_to_cpu(idst_dir->mrec->sequence_number));
++
++	if (ntfs_index_add_filename(
++		    idst_dir, fn,
++		    MK_MREF(idst->mft_no,
++			    le16_to_cpu(idst->mrec->sequence_number)))) {
++		ntfs_log_perror("adding dst dirent");
++		goto out;
++	}
++
++	idst->mrec->link_count =
++		cpu_to_le16(le16_to_cpu(idst->mrec->link_count) + 1);
++
++	ntfs_inode_mark_dirty(idst);
++	ret = 0;
++
++out:
++	free(fn);
++	if (sictx)
++		ntfs_index_ctx_put(sictx);
++	if (sactx)
++		ntfs_attr_put_search_ctx(sactx);
++	return ret;
++}
++
++static int
++ntfsutil_new_hardlink(struct ntfsutil_cp_ctx *ctx,
++		      ntfs_inode *isrc_dir, ntfs_inode *isrc,
++		      ntfs_inode *idst_dir, u64 dst_ino, const char *filename)
++{
++	ntfs_inode *idst;
++	ntfschar *ufilename;
++	int ret, ufilename_len;
++
++	ret       = 1;
++	idst      = NULL;
++	ufilename = NULL;
++
++	ntfs_log_trace("Entering.\n");
++	ntfs_log_progress("Creating hardlink %s to 0x%llx in 0x%llx\n",
++			  filename, MREF(dst_ino), MREF(idst_dir->mft_no));
++
++	idst = ntfs_inode_open(ctx->dst.vol, dst_ino);
++	if (!idst) {
++		ntfs_log_perror("opening inode 0x%016llx\n", dst_ino);
++		goto out;
++	}
++
++	ufilename_len = ntfs_mbstoucs(filename, &ufilename, NTFS_MAX_NAME_LEN);
++	if (ufilename_len == -1) {
++		ufilename = NULL;
++		ntfs_log_perror("converting '%s' to unicode", filename);
++		goto out;
++	}
++
++	ret = ntfsutil_new_dirent(ctx,
++				  ufilename, ufilename_len,
++				  ufilename, ufilename_len,
++				  isrc_dir, isrc,
++				  idst_dir, idst);
++
++out:
++	if (idst)
++		ntfs_inode_close(idst);
++	free(ufilename);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++/**
++ * ntfsutil_new_file() - create a new file (based on @isrc)
++ *
++ * @src: name of source file
++ * @_dst: optional name of new file (if NULL, @src will be used)
++ * @type: {S_IFREG,S_IFDIR}
++ * @isrc_dir: inode of directory containing @src
++ * @isrc: inode of @src
++ * @idst_dir: inode in which to create new file
++ */
++static ntfs_inode *
++ntfsutil_new_file(struct ntfsutil_cp_ctx *ctx,
++		  const char *src, const char *_dst, int type,
++		  ntfs_inode *isrc_dir, ntfs_inode *isrc, ntfs_inode *idst_dir)
++{
++	char *dst;
++	ntfs_attr *adst;
++	ntfs_inode *idst;
++	ntfschar *usrc, *udst;
++	ntfs_index_context *dictx;
++	ntfs_attr_search_ctx *dactx;
++	int usrc_len, udst_len, ret;
++
++	dst       = NULL;
++	idst      = NULL;
++	dictx     = NULL;
++	dactx     = NULL;
++	usrc      = NULL;
++	udst      = NULL;
++
++	ntfs_log_trace("Entering for file %s.\n", (_dst ? : src));
++
++	if (!(dst = ntfsutil_strdup((_dst ? : src))))
++		goto out;
++
++	idst = ntfs_pathname_to_inode(idst_dir->vol, idst_dir, dst);
++	if (idst) {
++		ntfs_inode_close(idst);
++		errno = EEXIST;
++		idst = NULL;
++		goto out;
++	} else if (errno != ENOENT) {
++		ntfs_log_perror("searching for destination file");
++		goto out;
++	}
++
++	usrc_len = ntfs_mbstoucs(src, &usrc, 0);
++	if (usrc_len == -1) {
++		ntfs_log_perror("converting '%s' to unicode", src);
++		goto out;
++	}
++
++	udst_len = ntfs_mbstoucs(dst, &udst, 0);
++	if (udst_len == -1) {
++		ntfs_log_perror("converting '%s' to unicode", dst);
++		goto out;
++	}
++
++	idst = ntfs_create(idst_dir, udst, udst_len, type);
++	if (!idst) {
++		ntfs_log_perror("creating new inode");
++		goto out;
++	}
++
++	if (type == S_IFREG) {
++		/*
++		 * remove empty data attribute here as it is simpler to
++		 * create a new one when we copy src attrs to dst inode
++		 * than to update an existing (possibly resident) one
++		 */
++		adst = ntfs_attr_open(idst, AT_DATA, NULL, 0);
++		if (!adst) {
++			ntfs_log_perror("opening data attribute");
++			goto out;
++		}
++
++		/* adst closed in ntfs_attr_rm() */
++		if (ntfs_attr_rm(adst)) {
++			ntfs_log_perror("removing data attribute");
++			goto out;
++		}
++	}
++
++	if (!isrc_dir || !isrc || !ctx->opts.preserve)
++		goto out;
++
++	/*
++	 * we're preserving metadata, which means we need the new
++	 * directory entry in dst_dir to match that of the original
++	 * in src_dir.  so read the src_dir dirent and copy the relevant
++	 * bits into the dst_dir dirent.
++	 */
++	ntfs_log_trace("updating new dirent\n");
++
++	/*
++	 * remove POSIX filename created by ntfs_create()
++	 */
++	dactx = ntfs_attr_get_search_ctx(idst, NULL);
++	if (!dactx) {
++		ntfs_log_perror("getting dst attr ctx");
++		goto fail;
++	}
++
++	while (!(ret = ntfs_attrs_walk(dactx))) {
++		if (dactx->attr->type == AT_FILE_NAME) {
++			if (ntfs_attr_record_rm(dactx)) {
++				ntfs_log_perror("removing original filename");
++				goto fail;
++			}
++
++			idst->mrec->link_count = cpu_to_le16(0);
++			break;
++		}
++	}
++
++	if (ret) {
++		ntfs_log_perror("removing original filename");
++		goto fail;
++	}
++
++	/*
++	 * remove POSIX dirent created by ntfs_create()
++	 */
++	dictx = ntfs_index_ctx_get(idst_dir, NTFS_INDEX_I30, 4);
++	if (!dictx) {
++		ntfs_log_perror("getting dst index ctx");
++		goto fail;
++	}
++
++	while (!(ret = ntfs_index_iterate_next(dictx))) {
++		FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)&dictx->entry->key;
++		if (udst_len == fn->file_name_length &&
++		    idst_dir->mft_no == MREF_LE(fn->parent_directory) &&
++		    !ntfs_ucsncmp(udst, fn->file_name, udst_len)) {
++			if (ntfs_index_rm(dictx)) {
++				ntfs_log_perror("removing original dirent");
++				goto fail;
++			}
++			break;
++		}
++	}
++
++	if (ret) {
++		ntfs_log_perror("finding original dirent");
++		goto fail;
++	}
++
++	if (ntfsutil_new_dirent(ctx,
++				usrc, usrc_len,
++				udst, udst_len,
++				isrc_dir, isrc,
++				idst_dir, idst)) {
++		ntfs_log_perror("adding new dirent");
++		goto fail;
++	}
++
++out:
++	if (dictx)
++		ntfs_index_ctx_put(dictx);
++	if (dactx)
++		ntfs_attr_put_search_ctx(dactx);
++	free(dst);
++	free(usrc);
++	free(udst);
++	ntfs_log_trace("Done.\n");
++	return idst;
++fail:
++	ret = errno;
++	if (idst) {
++		ntfs_delete(&idst, idst_dir, udst, udst_len);
++		if (idst) {
++			ntfs_log_perror("leaking partially created file");
++			ntfs_inode_close(idst);
++		}
++	}
++	errno = ret;
++	idst = NULL;
++	goto out;
++}
++
++static int
++ntfsutil_initialize_resident_attr(ATTR_RECORD *sattr, ATTR_RECORD **dattr)
++{
++	int ret, size;
++
++	ret  = 1;
++	size = le32_to_cpu(sattr->length);
++
++	*dattr = ntfs_malloc(size);
++	if (!*dattr) {
++		errno = ENOMEM;
++		goto out;
++	}
++
++	memcpy(*dattr, sattr, size);
++	ret = 0;
++
++out:
++	return ret;
++}
++
++static int
++ntfsutil_new_nonresident_attr(struct ntfsutil_cp_ctx *ctx,
++			      ATTR_RECORD *attr, ntfs_inode *idst)
++{
++	ntfs_attr *adst;
++	ntfschar *attr_name;
++	int ret, attr_name_length;
++
++	ret  = 1;
++	adst = NULL;
++
++	ntfs_log_trace("Entering for attribute 0x%x.\n", attr->type);
++
++	if (!attr->non_resident) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	attr_name_length = attr->name_length;
++	attr_name = (attr_name_length ? ntfs_attr_get_name(attr) : NULL);
++
++	adst = ntfs_attr_open(idst, attr->type, attr_name, attr_name_length);
++	if (adst) {
++		ntfs_attr_close(adst);
++		errno = EEXIST;
++		goto out;
++	}
++
++	if (errno != ENOENT) {
++		ntfs_log_perror("opening destination attribute");
++		goto out;
++	}
++
++	ret = ntfs_attr_add(idst, attr->type,
++			    attr_name, attr_name_length, NULL, 0);
++	if (ret)
++		ntfs_log_perror("creating destination attribute");
++
++out:
++	ntfs_log_trace("Done (ret %d errno %d).\n", ret, errno);
++	return ret;
++}
++
++static int
++ntfsutil_cp_security_descriptor(struct ntfsutil_cp_ctx *ctx,
++				ntfs_volume *src, ntfs_volume *dst,
++				u32 src_security_id, u32 *dst_security_id)
++{
++	int ret;
++	SDS_ENTRY *ssd, *dsd;
++
++	ret = 1;
++	ssd = NULL;
++	dsd = NULL;
++
++	ssd = ntfs_sd_find_by_id(src, src_security_id);
++	if (!ssd) {
++		ntfs_log_perror("couldn't find src sd");
++		goto out;
++	}
++
++	dsd = ntfs_sd_add(dst, &ssd->sid,
++			  le32_to_cpu(ssd->length) -
++			  sizeof(SECURITY_DESCRIPTOR_HEADER));
++	if (!dsd) {
++		ntfs_log_perror("couldn't add dst sd");
++		goto out;
++	}
++
++	*dst_security_id = le32_to_cpu(dsd->security_id);
++	ret = 0;
++
++out:
++	free(ssd);
++	free(dsd);
++	return ret;
++}
++
++static int
++ntfsutil_cp_create_security_attr(struct ntfsutil_cp_ctx *ctx,
++				 ntfs_volume *vsrc, u32 src_security_id,
++				 ntfs_inode *idst)
++{
++	SDS_ENTRY *ssd;
++	int ret, sid_length;
++	SECURITY_DESCRIPTOR_ATTR *dsa;
++
++	ret = 1;
++	ssd = NULL;
++	dsa = NULL;
++
++	ssd = ntfs_sd_find_by_id(vsrc, src_security_id);
++	if (!ssd) {
++		ntfs_log_perror("couldn't find src sd");
++		goto out;
++	}
++
++	sid_length = le32_to_cpu(ssd->length) -
++		sizeof(SECURITY_DESCRIPTOR_HEADER);
++
++	dsa = ntfs_calloc(sid_length);
++	if (!dsa) {
++		ntfs_log_perror("allocating dst security attr");
++		goto out;
++	}
++
++	memcpy(dsa, &ssd->sid, sid_length);
++
++	if (ntfs_attr_add(idst, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0,
++			  (u8 *)dsa, sid_length)) {
++		ntfs_log_perror("adding dst security attr");
++		goto out;
++	}
++
++	ret = 0;
++
++out:
++	free(ssd);
++	free(dsa);
++	return ret;
++}
++
++static int
++ntfsutil_cp_remove_security_attribute(struct ntfsutil_cp_ctx *ctx,
++				      ntfs_inode *idst)
++{
++	int ret;
++	ntfs_attr *dattr;
++
++	ret   = 1;
++	dattr = NULL;
++
++	dattr = ntfs_attr_open(idst, AT_SECURITY_DESCRIPTOR, NULL, 0);
++	if (!dattr) {
++		if (errno == ENOENT) {
++			ntfs_log_debug("no original security descriptor\n");
++			goto done;
++		}
++
++		ntfs_log_perror("opening original security descriptor");
++		goto out;
++	}
++
++	/*
++	 * dattr closed in ntfs_attr_rm()
++	 */
++	if (ntfs_attr_rm(dattr)) {
++		ntfs_log_perror("removing original security descriptor");
++		goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	return ret;
++}
++
++static int
++ntfsutil_cp_update_reparse_index(struct ntfsutil_cp_ctx *ctx,
++				 ntfs_inode *idst)
++{
++	int ret, size;
++	REPARSE_POINT *rp;
++
++	ret = 1;
++	rp  = NULL;
++
++	idst->flags |= FILE_ATTR_REPARSE_POINT;
++	ntfs_inode_mark_dirty(idst);
++
++	size = ntfs_get_ntfs_reparse_data(NULL, NULL, 0, idst);
++	if (size < 0) {
++		errno = -size;
++		ntfs_log_perror("getting reparse data");
++		goto out;
++	}
++
++	rp = ntfs_malloc(size);
++	if (!rp) {
++		ntfs_log_perror("allocating reparse buffer");
++		goto out;
++	}
++
++	size = ntfs_get_ntfs_reparse_data(NULL, (char *)rp, size, idst);
++	if (size < 0) {
++		errno = -size;
++		ntfs_log_perror("getting reparse data");
++		goto out;
++	}
++
++	ret = ntfs_update_reparse_index(idst, rp);
++	if (ret) {
++		ntfs_log_perror("updating reparse index");
++		goto out;
++	}
++
++out:
++	free(rp);
++	return ret;
++}
++
++/*
++ * keep original standard information, but update:
++ *   - creation, data change, mft change, and access times
++ *   - file attributes
++ *   - security_id
++ */
++static int
++ntfsutil_cp_standard_information(struct ntfsutil_cp_ctx *ctx,
++				 ntfs_inode *idst, ATTR_RECORD *sattr)
++{
++	int ret;
++	ntfs_attr_search_ctx *actx;
++	STANDARD_INFORMATION *sisrc, *sidst;
++
++	ret  = 1;
++	actx = NULL;
++
++	ntfs_log_trace("Entering.\n");
++
++	if (sattr->type != AT_STANDARD_INFORMATION) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	actx = ntfs_attr_get_search_ctx(idst, NULL);
++	if (!actx) {
++		ntfs_log_perror("creating search context");
++		goto out;
++	}
++
++	if (ntfs_attr_lookup(AT_STANDARD_INFORMATION, NULL, 0,
++			     IGNORE_CASE, 0, NULL, 0, actx)) {
++		ntfs_log_perror("finding STANDARD_INFORMATION");
++		goto out;
++	}
++
++	sisrc = (STANDARD_INFORMATION *)
++		((u8 *)sattr + le16_to_cpu(sattr->value_offset));
++	sidst = (STANDARD_INFORMATION *)
++		((u8 *)actx->attr + le16_to_cpu(actx->attr->value_offset));
++
++	if (le32_to_cpu(sattr->value_length) >=
++	    offsetof(STANDARD_INFORMATION, v3_end) &&
++	    le32_to_cpu(sisrc->security_id) != 0) {
++		le32 dst_security_id = 0;
++		u32 ssid = le32_to_cpu(sisrc->security_id);
++
++		/*
++		 * remove security attr added by ntfs_create()
++		 */
++		if (ntfsutil_cp_remove_security_attribute(ctx, idst)) {
++			ntfs_log_perror("removing original security attr");
++			goto out;
++		}
++
++#ifdef NTFSUTIL_CP_SECURE_SDS
++		/*
++		 * src file has a security_id: copy the security descriptor
++		 * from the src volume to the dst volume and assign the
++		 * resulting security_id to the dst file.
++		 */
++		if (ntfsutil_cp_security_descriptor(ctx,
++						    ctx->src.vol,
++						    ctx->dst.vol,
++						    ssid,
++						    &dst_security_id)) {
++			ntfs_log_perror("copying security descriptor");
++			goto out;
++		}
++
++		if (le32_to_cpu(actx->attr->value_length) <
++		    offsetof(STANDARD_INFORMATION, v3_end)) {
++			/*
++			 * dst standard information has smaller v1 format...
++			 * need to expand it before adding v3 fields
++			 */
++			if (ntfs_resident_attr_value_resize(
++				    actx->mrec, actx->attr,
++				    offsetof(STANDARD_INFORMATION, v3_end))) {
++				ntfs_log_perror("resizing standard info");
++				goto out;
++			}
++		}
++
++#else
++		/*
++		 * copy security descriptor from src volume into a
++		 * security attribute in the destination file.
++		 */
++		if (ntfsutil_cp_create_security_attr(ctx, ctx->src.vol,
++						     ssid, idst)) {
++			ntfs_log_perror("creating security attribute");
++			goto out;
++		}
++#endif
++		/*
++		 * reinitialize standard info attr after mrec shuffling
++		 */
++		ntfs_attr_reinit_search_ctx(actx);
++
++		if (ntfs_attr_lookup(AT_STANDARD_INFORMATION, NULL, 0,
++				     IGNORE_CASE, 0, NULL, 0, actx)) {
++			ntfs_log_perror("reloading standard info");
++			goto out;
++		}
++
++		sidst = (STANDARD_INFORMATION *)
++			((u8 *)actx->attr +
++			 le16_to_cpu(actx->attr->value_offset));
++
++#ifdef NTFSUTIL_CP_SECURE_SDS
++		sidst->security_id = cpu_to_le32(dst_security_id);
++#endif
++	}
++
++	/*
++	 * we do not create compressed files, since libntfs
++	 * doesn't support writing to them.
++	 */
++	sidst->file_attributes = (sisrc->file_attributes &
++				  ~FILE_ATTR_COMPRESSED);
++
++	sidst->creation_time = sisrc->creation_time;
++	sidst->last_data_change_time = sisrc->last_data_change_time;
++	sidst->last_mft_change_time = sisrc->last_mft_change_time;
++	sidst->last_access_time = sisrc->last_access_time;
++
++	idst->flags = sidst->file_attributes;
++	idst->creation_time = ntfs2utc(sidst->creation_time);
++	idst->last_data_change_time = ntfs2utc(sidst->last_data_change_time);
++	idst->last_mft_change_time = ntfs2utc(sidst->last_mft_change_time);
++	idst->last_access_time = ntfs2utc(sidst->last_access_time);
++
++	ntfs_inode_mark_dirty(idst);
++
++	ret = 0;
++
++out:
++	if (actx)
++		ntfs_attr_put_search_ctx(actx);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++static int
++ntfsutil_cp_resident_attr(struct ntfsutil_cp_ctx *ctx, ATTR_RECORD *a,
++			  ntfs_inode *idst_dir, ntfs_inode *idst)
++{
++	u8 *value;
++	s32 value_length;
++	ATTR_RECORD *attr;
++	ntfschar *attr_name;
++	int ret, attr_name_length;
++	ntfs_attr_search_ctx *actx;
++
++	ret  = 1;
++	actx = NULL;
++	attr = NULL;
++
++	ntfs_log_trace("Entering for attr 0x%x.\n", a->type);
++
++	if (a->non_resident) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	switch (a->type) {
++	case AT_STANDARD_INFORMATION:
++		ret = ntfsutil_cp_standard_information(ctx, idst, a);
++		if (ret)
++			ntfs_log_perror("copying standard information");
++		goto out;
++
++	case AT_FILE_NAME:
++		/*
++		 * we create appropriate file name attrs in
++		 * ntfsutil_new_dirent()
++		 */
++		errno = EOPNOTSUPP;
++		ntfs_log_perror("copying filename");
++		goto out;
++	default:
++		if (ntfsutil_initialize_resident_attr(a, &attr)) {
++			ntfs_log_perror("initializing new attr");
++			goto out;
++		}
++		break;
++	}
++
++	attr_name_length = attr->name_length;
++	attr_name = (attr_name_length ? ntfs_attr_get_name(attr) : NULL);
++
++	value_length = le32_to_cpu(attr->value_length);
++	value = (u8 *)attr + le16_to_cpu(attr->value_offset);
++
++	actx = ntfs_attr_get_search_ctx(idst, NULL);
++	if (!actx) {
++		ntfs_log_perror("getting attr search context");
++		goto out;
++	}
++
++	if (!ntfs_attr_lookup(attr->type, attr_name, attr_name_length,
++			      CASE_SENSITIVE, 0, value, value_length, actx)) {
++		ret = 0;
++		goto out;
++	} else if (errno != ENOENT) {
++		ntfs_log_perror("looking up resident attr");
++		goto out;
++	}
++
++	ret = ntfs_attr_add(idst, attr->type, attr_name,
++			    attr_name_length, value, (s64)value_length);
++	if (ret)
++		ntfs_log_perror("creating destination attribute");
++
++out:
++	free(attr);
++	if (actx)
++		ntfs_attr_put_search_ctx(actx);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++static int
++ntfsutil_cp_attr(struct ntfsutil_cp_ctx *ctx, ATTR_RECORD *attr,
++		 ntfs_inode *isrc, ntfs_inode *idst_dir, ntfs_inode *idst)
++{
++	char *buf;
++	ntfschar *attr_name;
++	u64 offset, remaining;
++	ntfs_attr *asrc, *adst;
++	int ret, attr_name_length;
++
++	ret       = 1;
++	buf       = NULL;
++	asrc      = NULL;
++	adst      = NULL;
++	offset    = 0;
++	remaining = 0;
++
++	ntfs_log_trace("Entering attr 0x%x\n", attr->type);
++
++	if (!ctx || !isrc || !idst || !attr) {
++		errno = EINVAL;
++		ntfs_log_perror("invalid arguments");
++		goto out;
++	}
++
++	if (!attr->non_resident) {
++		ret = ntfsutil_cp_resident_attr(ctx, attr, idst_dir, idst);
++		if (ret)
++			ntfs_log_perror("copying resident attr");
++		goto out;
++	}
++
++	buf = ntfs_malloc(NTFS_BUF_SIZE);
++	if (!buf) {
++		ntfs_log_perror("allocating attribute buffer");
++		goto out;
++	}
++
++	attr_name_length = attr->name_length;
++	attr_name = (attr_name_length ? ntfs_attr_get_name(attr) : NULL);
++
++	if (ntfsutil_new_nonresident_attr(ctx, attr, idst)) {
++		if (errno != EEXIST) {
++			ntfs_log_perror("adding destination attribute");
++			goto out;
++		}
++	}
++
++	asrc = ntfs_attr_open(isrc, attr->type, attr_name, attr_name_length);
++	if (!asrc) {
++		ntfs_log_perror("opening source attribute");
++		goto out;
++	}
++
++	adst = ntfs_attr_open(idst, attr->type, attr_name, attr_name_length);
++	if (!adst) {
++		ntfs_log_perror("opening destination attribute");
++		goto out;
++	}
++
++	if (adst->data_size != asrc->data_size) {
++		if (__ntfs_attr_truncate(adst, asrc->data_size, FALSE)) {
++			ntfs_log_perror("truncating destination attribute");
++			goto out;
++		}
++	}
++
++	remaining = asrc->data_size;
++	ntfs_log_verbose("Starting write.\n");
++
++	while (remaining) {
++		u64 chunk, br, bw;
++
++		if (caught_terminate)
++			goto out;
++
++		chunk = min(NTFS_BUF_SIZE, remaining);
++
++		br = ntfs_attr_pread(asrc, offset, chunk, buf);
++		if (br != chunk) {
++			ntfs_log_perror("ntfs_attr_pread failed");
++			goto out;
++		}
++
++		bw = ntfs_attr_pwrite(adst, offset, chunk, buf);
++		if (bw != chunk) {
++			ntfs_log_perror("ntfs_attr_pwrite failed");
++			goto out;
++		}
++
++		offset    += chunk;
++		remaining -= chunk;
++	}
++
++	ret = 0;
++out:
++	free(buf);
++	if (asrc)
++		ntfs_attr_close(asrc);
++	if (adst)
++		ntfs_attr_close(adst);
++	ntfs_log_trace("Done (ret %d errno %d).\n", ret, errno);
++	return ret;
++}
++
++static int
++ntfsutil_cp_inode(struct ntfsutil_cp_ctx *ctx, ntfs_inode *isrc,
++		  ntfs_inode *idst_dir, ntfs_inode *idst)
++{
++	int ret, rc;
++	ntfs_attr_search_ctx *sactx;
++
++	ret   = 1;
++	sactx = NULL;
++
++	ntfs_log_trace("Entering\n");
++
++	sactx = ntfs_attr_get_search_ctx(isrc, NULL);
++	if (!sactx)
++		goto out;
++
++	while (!(rc = ntfs_attrs_walk(sactx))) {
++		if (caught_terminate)
++			goto out;
++
++		switch (sactx->attr->type) {
++		case AT_INDEX_ROOT:
++		case AT_INDEX_ALLOCATION:
++		case AT_BITMAP:
++			if (sactx->attr->name_length == 4 &&
++			    !memcmp(ntfs_attr_get_name(sactx->attr),
++				    NTFS_INDEX_I30, 4))
++				goto skip;
++			break;
++
++		case AT_STANDARD_INFORMATION:
++		case AT_SECURITY_DESCRIPTOR:
++			if (!ctx->opts.preserve)
++				goto skip;
++			break;
++
++		case AT_REPARSE_POINT:
++			if (!ctx->opts.reparse_preserve)
++				goto skip;
++			break;
++
++		case AT_FILE_NAME:
++		case AT_ATTRIBUTE_LIST:
++		case AT_OBJECT_ID:
++		skip:
++			ntfs_log_verbose("skipping attribute 0x%x\n",
++					 sactx->attr->type);
++			continue;
++
++		default:
++			break;
++		}
++
++		if (ntfsutil_cp_attr(ctx, sactx->attr, isrc, idst_dir, idst)) {
++			ntfs_log_perror("copying attr");
++			goto out;
++		}
++
++		if (sactx->attr->type == AT_REPARSE_POINT) {
++			if (ntfsutil_cp_update_reparse_index(ctx, idst)) {
++				ntfs_log_perror("updating reparse index");
++				goto out;
++			}
++		}
++	}
++
++	if (rc && errno != ENOENT) {
++		ntfs_log_perror("Enumerating source attributes");
++		goto out;
++	}
++
++	ret = ntfsutil_cp_map_inos(ctx, isrc, idst);
++
++out:
++	if (sactx)
++		ntfs_attr_put_search_ctx(sactx);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++static int
++ntfsutil_cp_readdir(void *private, const ntfschar *name, const int name_len,
++		    const int name_type, const s64 pos __attribute__((unused)),
++		    const MFT_REF mref, const unsigned dt_type)
++{
++	int ret;
++	char *filename;
++	struct list_head *head;
++	struct ntfsutil_dirent *entry;
++
++	ret      = 1;
++	entry    = NULL;
++	filename = NULL;
++	head     = (struct list_head *)private;
++
++	if (ntfs_ucstombs(name, name_len, &filename, MAX_PATH) < 0) {
++		filename = NULL;
++		ntfs_log_perror("converting direntry");
++		goto out;
++	}
++
++	if (!strcmp(filename, ".") || !strcmp(filename, ".."))
++		goto done;
++
++	entry = ntfs_calloc(sizeof(*entry));
++	if (!entry)
++		goto out;
++
++	INIT_LIST_HEAD(&entry->list);
++	sprintf(entry->name, "%s", filename);
++	list_add_tail(&entry->list, head);
++
++done:
++	ret = 0;
++out:
++	free(filename);
++	return ret;
++}
++
++static int
++ntfsutil_cp_directory_contents(struct ntfsutil_cp_ctx *ctx,
++			       ntfs_inode *isrc_dir, const char *src_dir_path,
++			       const char *dst_dir_path)
++{
++	int ret;
++	s64 pos;
++	char *del;
++	struct ntfsutil_dirent *entry;
++	struct list_head head, *itr, *tmp;
++
++	ret = 1;
++	pos = 0;
++	del = (src_dir_path[strlen(src_dir_path) - 1] == '/' ? "" : "/");
++	INIT_LIST_HEAD(&head);
++
++	if (ntfs_readdir(isrc_dir, &pos, &head, ntfsutil_cp_readdir)) {
++		ntfs_log_perror("reading directory %s", src_dir_path);
++		goto out;
++	}
++
++	list_for_each(itr, &head) {
++		char *new_src;
++
++		if (caught_terminate) {
++			ntfs_log_error("SIGTERM or SIGINT received.  "
++				       "Aborting copy.\n");
++			ret = 1;
++			goto out;
++		}
++
++		entry = list_entry(itr, struct ntfsutil_dirent, list);
++		if (asprintf(&new_src, "%s%s%s",
++			     src_dir_path, del, entry->name) == -1) {
++			errno = ENOMEM;
++			goto out;
++		}
++
++		ret = ntfsutil_cp_path(ctx, new_src, dst_dir_path, NULL);
++		free(new_src);
++
++		if (ret)
++			goto out;
++	}
++
++	ret = 0;
++
++out:
++	list_for_each_safe(itr, tmp, &head) {
++		entry = list_entry(itr, struct ntfsutil_dirent, list);
++		list_del(&entry->list);
++		free(entry);
++	}
++
++	return ret;
++}
++
++/**
++ * ntfsutil_cp_path() - copy @src_path into @dst_dir
++ *
++ * if @_dst is not NULL, new file will be named @_dst; otherwise, it
++ * will be named basename(@src_path)
++ */
++static int
++ntfsutil_cp_path(struct ntfsutil_cp_ctx *ctx,
++		 const char *src_path, const char *dst_dir, const char *_dst)
++{
++	u64 dst_ino;
++	int ret, match, type;
++	char *src, *src_dir, *dst;
++	ntfs_inode *isrc, *idst, *isrc_dir, *idst_dir;
++
++	ret      = 1;
++	type     = -1;
++	isrc     = NULL;
++	idst     = NULL;
++	isrc_dir = NULL;
++	idst_dir = NULL;
++	src      = NULL;
++	src_dir  = NULL;
++	dst      = NULL;
++
++	ntfs_log_trace("Entering: %s %s\n", src_path, dst_dir);
++
++	if (ntfsutil_path_split(src_path, &src_dir, &src))
++		goto out;
++
++	if (!(dst = ntfsutil_strdup((_dst ? : src))))
++		goto out;
++
++	match = ntfsutil_fnmatch(ctx, src_path);
++	if (match == FNM_NOMATCH)
++		goto done;
++	else if (match) {
++		errno = match;
++		goto out;
++	}
++
++	isrc_dir = ntfs_pathname_to_inode(ctx->src.vol, NULL, src_dir);
++	if (!isrc_dir) {
++		ntfs_log_perror("Failed opening %s", src_dir);
++		goto out;
++	}
++
++	isrc = ntfs_pathname_to_inode(ctx->src.vol, isrc_dir, src);
++	if (!isrc) {
++		ntfs_log_perror("Failed opening %s", src_path);
++		goto out;
++	}
++
++	if (isrc->mft_no < FILE_first_user && !ctx->opts.system) {
++		ntfs_log_progress("Omitting system file %s\n", src_path);
++		goto done;
++	}
++
++	if (isrc->flags & FILE_ATTR_REPARSE_POINT) {
++		if (!ctx->opts.reparse_preserve && !ctx->opts.reparse_update) {
++			ntfs_log_info("Omitting reparse point %s\n", src_path);
++			goto done;
++		}
++	}
++
++	if (isrc->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
++		if (!ctx->opts.recursive) {
++			ntfs_log_info("Omitting directory %s\n", src_path);
++			goto done;
++		}
++		type = S_IFDIR;
++	} else {
++		type = S_IFREG;
++	}
++
++	idst_dir = ntfs_pathname_to_inode(ctx->dst.vol, NULL, dst_dir);
++	if (!idst_dir) {
++		ntfs_log_perror("Opening destination directory %s", dst_dir);
++		goto out;
++	}
++
++	if (ntfsutil_cp_circular(ctx, isrc, idst_dir)) {
++		errno = ELOOP;
++		ntfs_log_perror("Circular copy (%s, %s)", src_path, dst_dir);
++		goto out;
++	}
++
++	if (ntfsutil_cp_hardlink(ctx, isrc, &dst_ino)) {
++		ret = ntfsutil_new_hardlink(ctx, isrc_dir, isrc,
++					    idst_dir, dst_ino, src);
++		if (ret)
++			ntfs_log_perror("Adding hardlink from %s to 0x%llx "
++					"in %s", dst_dir, MREF(dst_ino), src);
++		goto out;
++	}
++
++	if (!(idst_dir->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
++		errno = EEXIST;
++		ntfs_log_perror("%s already exists", dst_dir);
++		goto out;
++	}
++
++	idst = ntfsutil_new_file(ctx, src, dst, type,
++				 isrc_dir, isrc, idst_dir);
++	if (!idst) {
++		ntfs_log_perror("Creating file %s/%s", dst_dir, dst);
++		goto out;
++	}
++
++	ntfs_log_progress("Copying %s (0x%llx 0x%llx) into %s (0x%llx)\n",
++			 src_path, MREF(isrc->mft_no), MREF(idst->mft_no),
++			  dst_dir, MREF(idst_dir->mft_no));
++
++	if (ntfsutil_cp_inode(ctx, isrc, idst_dir, idst)) {
++		ntfs_log_perror("Copying %s to %s/%s",
++				src_path, dst_dir, dst);
++		goto out;
++	}
++
++	if (ctx->opts.recursive &&
++	    isrc->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
++		char *new_dst, *del;
++
++		del = dst_dir[strlen(dst_dir) - 1] == '/' ? "" : "/";
++		if (asprintf(&new_dst, "%s%s%s", dst_dir, del, dst) == -1) {
++			errno = ENOMEM;
++			goto out;
++		}
++
++		ret = ntfsutil_cp_directory_contents(ctx, isrc,
++						     src_path, new_dst);
++		free(new_dst);
++
++		if (ret)
++			goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	free(src);
++	free(src_dir);
++	free(dst);
++	if (isrc)
++		ntfs_inode_close(isrc);
++	if (idst)
++		ntfs_inode_close(idst);
++	if (isrc_dir)
++		ntfs_inode_close(isrc_dir);
++	if (idst_dir)
++		ntfs_inode_close(idst_dir);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++static int
++ntfsutil_cp_mkdir(struct ntfsutil_cp_ctx *ctx, const char *path)
++{
++	int ret;
++	u64 ino;
++	char *dir, *name;
++	ntfs_index_context *sictx;
++	ntfs_inode *isrc_dir, *isrc, *idst_dir, *idst;
++
++	ret      = 1;
++	dir      = NULL;
++	name     = NULL;
++	sictx    = NULL;
++	isrc_dir = NULL;
++	isrc     = NULL;
++	idst_dir = NULL;
++	idst     = NULL;
++
++	ntfs_log_trace("Entering for %s\n", path);
++
++	ino = ntfs_pathname_to_inode_num(ctx->dst.vol, NULL, path);
++	if (ino != (u64)-1)
++		goto done;
++	else if (errno != ENOENT) {
++		ntfs_log_perror("searching for %s", path);
++		goto out;
++	}
++
++	if (ntfsutil_path_split(path, &dir, &name))
++		goto out;
++
++	isrc_dir = ntfs_pathname_to_inode(ctx->src.vol, NULL, dir);
++	if (!isrc_dir) {
++		ntfs_log_perror("opening %s", dir);
++		goto out;
++	}
++
++	isrc = ntfs_pathname_to_inode(ctx->src.vol, isrc_dir, name);
++	if (!isrc) {
++		ntfs_log_perror("opening %s", name);
++		goto out;
++	}
++
++	if (!(isrc->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
++		errno = ENOTDIR;
++		ntfs_log_perror("%s is not a directory", path);
++		goto out;
++	}
++
++	idst_dir = ntfs_pathname_to_inode(ctx->dst.vol, NULL, dir);
++	if (!idst_dir) {
++		ntfs_log_perror("opening %s", dir);
++		goto out;
++	}
++
++	if (!(idst_dir->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
++		errno = EEXIST;
++		ntfs_log_perror("%s already exists", dir);
++		goto out;
++	}
++
++	if (ntfsutil_cp_circular(ctx, isrc, idst_dir)) {
++		errno = ELOOP;
++		ntfs_log_perror("circular copy (%s, %s)", name, dir);
++		goto out;
++	}
++
++	if (ntfsutil_cp_hardlink(ctx, isrc, &ino)) {
++		ret = ntfsutil_new_hardlink(ctx, isrc_dir, isrc,
++					    idst_dir, ino, name);
++		if (ret)
++			ntfs_log_perror("adding hardlink from %s to 0x%llx "
++					"in %s", dir, MREF(ino), name);
++		goto dirents;
++	}
++
++	idst = ntfsutil_new_file(ctx, name, NULL, S_IFDIR,
++				 isrc_dir, isrc, idst_dir);
++	if (!idst) {
++		ntfs_log_perror("creating %s", path);
++		goto out;
++	}
++
++	ntfs_log_progress("Copying %s (0x%llx 0x%llx) into %s (0x%llx)\n",
++			  path, MREF(isrc->mft_no), MREF(idst->mft_no),
++			  dir, MREF(idst_dir->mft_no));
++
++	if (ntfsutil_cp_inode(ctx, isrc, idst_dir, idst)) {
++		ntfs_log_perror("copying %s", path);
++		goto out;
++	}
++
++dirents:
++	sictx = ntfs_index_ctx_get(isrc_dir, NTFS_INDEX_I30, 4);
++	if (!sictx) {
++		ntfs_log_perror("getting src index ctx");
++		goto out;
++	}
++
++	while (!(ret = ntfs_index_iterate_next(sictx))) {
++		FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)&sictx->entry->key;
++		if (isrc->mft_no == MREF_LE(fn->parent_directory)) {
++			char *dirent;
++			if (ntfs_ucstombs(fn->file_name, fn->file_name_length,
++					  &dirent, 0) == -1) {
++				ntfs_log_perror("converting dirent");
++				goto out;
++			}
++
++			if (!strcmp(dirent, name)) {
++				free(dirent);
++				continue;
++			}
++
++			ret = ntfsutil_new_hardlink(ctx, isrc_dir, isrc,
++						    idst_dir, idst->mft_no,
++						    dirent);
++			if (ret) {
++				ntfs_log_perror("adding hardlink from %s to "
++						"0x%llx in %s", dir,
++						MREF(idst->mft_no), dirent);
++				free(dirent);
++				goto out;
++			}
++
++			free(dirent);
++		}
++	}
++
++	if (ret && errno != ENOENT) {
++		ntfs_log_perror("scanning source dirents");
++		goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	free(dir);
++	free(name);
++	if (sictx)
++		ntfs_index_ctx_put(sictx);
++	if (isrc)
++		ntfs_inode_close(isrc);
++	if (isrc_dir)
++		ntfs_inode_close(isrc_dir);
++	if (idst)
++		ntfs_inode_close(idst);
++	if (idst_dir)
++		ntfs_inode_close(idst_dir);
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++static int
++ntfsutil_cp_mkdirs(struct ntfsutil_cp_ctx *ctx, const char *_path)
++{
++	int ret;
++	u64 ino;
++	char *path, *p;
++
++	ret  = 1;
++	path = NULL;
++
++	ntfs_log_trace("Entering for %s\n", _path);
++
++	ino = ntfs_pathname_to_inode_num(ctx->dst.vol, NULL, _path);
++	if (ino != (u64)-1) {
++		errno = EEXIST;
++		ntfs_log_perror("creating %s", _path);
++		goto out;
++	} else if (errno != ENOENT) {
++		ntfs_log_perror("searching for %s", _path);
++		goto out;
++	}
++
++	path = ntfsutil_strdup(_path);
++	if (!path)
++		goto out;
++
++	p = path;
++	do {
++		p = strchr(++p, '/');
++		if (p)
++			*p = '\0';
++
++		ret = ntfsutil_cp_mkdir(ctx, path);
++		if (ret)
++			goto out;
++
++		if (p)
++			*p = '/';
++
++	} while (p && p[1] != '\0');
++
++out:
++	free(path);
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * faults in a reparse point target:
++ *   - mkdir -p src_tgt on dst
++ *   - cp -r src_tgt to dst
++ */
++static int
++ntfsutil_cp_reparse_target(struct ntfsutil_cp_ctx *ctx, char *src_tgt)
++{
++	int ret;
++	ntfs_inode *isrc_tgt;
++
++	ret      = 1;
++	isrc_tgt = NULL;
++
++	ntfs_log_trace("Entering for %s\n", src_tgt);
++
++	if (ntfsutil_cp_mkdirs(ctx, src_tgt)) {
++		ntfs_log_perror("mkdir %s", src_tgt);
++		goto out;
++	}
++
++	isrc_tgt = ntfs_pathname_to_inode(ctx->src.vol, NULL, src_tgt);
++	if (!isrc_tgt) {
++		ntfs_log_perror("opening %s", src_tgt);
++		goto out;
++	}
++
++	if (ntfsutil_cp_directory_contents(ctx,
++					   isrc_tgt, src_tgt, src_tgt)) {
++		ntfs_log_perror("copying reparse target %s", src_tgt);
++		goto out;
++	}
++
++	ret = 0;
++out:
++	if (isrc_tgt)
++		ntfs_inode_close(isrc_tgt);
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * look in @isrc for @sname file name attr.  if it exists, return copy
++ * of @sname.  if @sname == NULL or does not exist in @isrc,
++ * return copy of most appealing file name:
++ * WIN32_AND_DOS > WIN32 > POSIX > DOS.
++ */
++static int
++ntfsutil_cp_find_filename(struct ntfsutil_cp_ctx *ctx,
++			  ntfs_inode *isrc, const char *sname,
++			  char **_dname, MFT_REF *_ino)
++{
++	MFT_REF ino;
++	char *dname;
++	ntfschar *uname;
++	ntfs_attr_search_ctx *sactx;
++	int ret, rc, uname_len, type;
++
++	ret   = 1;
++	ino   = -1;
++	type  = -1;
++	dname = NULL;
++	uname = NULL;
++	sactx = NULL;
++
++	sactx = ntfs_attr_get_search_ctx(isrc, NULL);
++	if (!sactx) {
++		ntfs_log_perror("getting dst attr ctx");
++		goto out;
++	}
++
++	if (!sname)
++		goto fork;
++
++	if ((uname_len = ntfs_mbstoucs(sname, &uname, 0)) == -1)
++		goto out;
++
++	while (!(rc = ntfs_attrs_walk(sactx))) {
++		FILE_NAME_ATTR *fn;
++		if (sactx->attr->type != AT_FILE_NAME)
++			continue;
++
++		fn = (FILE_NAME_ATTR *)
++			((u8 *)sactx->attr +
++			 le16_to_cpu(sactx->attr->value_offset));
++
++		if (fn->file_name_length == uname_len &&
++		    !ntfs_ucsncmp(uname, fn->file_name, uname_len)) {
++			ino = MREF_LE(fn->parent_directory);
++			dname = ntfsutil_strdup(sname);
++			goto done;
++		}
++	}
++
++	if (rc && errno != ENOENT) {
++		ntfs_log_perror("walking attrs");
++		goto out;
++	}
++
++	ntfs_attr_reinit_search_ctx(sactx);
++
++fork:
++	while (!(rc = ntfs_attrs_walk(sactx))) {
++		FILE_NAME_ATTR *fn;
++		if (sactx->attr->type != AT_FILE_NAME)
++			continue;
++
++		fn = (FILE_NAME_ATTR *)
++			((u8 *)sactx->attr +
++			 le16_to_cpu(sactx->attr->value_offset));
++
++		if (fn->file_name_type > type &&
++		    (fn->file_name_type != FILE_NAME_DOS || type == -1)) {
++			free(dname);
++			dname = NULL;
++
++			if (ntfs_ucstombs(fn->file_name,
++					  fn->file_name_length,
++					  &dname, 0) == -1)
++				goto out;
++
++			ino = MREF_LE(fn->parent_directory);
++			type = fn->file_name_type;
++
++			if (type == FILE_NAME_WIN32_AND_DOS)
++				break;
++		}
++	}
++
++	if (rc && errno != ENOENT) {
++		ntfs_log_perror("walking attrs");
++		goto out;
++	}
++
++done:
++	if (!dname) {
++		if (!errno)
++			errno = EINVAL;
++		goto out;
++	}
++
++	*_dname = dname;
++	*_ino   = ino;
++	ret     = 0;
++
++out:
++	if (sactx)
++		ntfs_attr_put_search_ctx(sactx);
++	free(uname);
++	return ret;
++}
++
++/*
++ * given a source path and the ino of the copied dir,
++ * produce a valid path to the ino, making the dst path
++ * as similar as possible as the source path.
++ * return the path formatted as a mount point.
++ */
++static int
++ntfsutil_cp_map_reparse_path(struct ntfsutil_cp_ctx *ctx,
++			     MFT_REF dst_ino, const char *_src, char **dst)
++{
++	int ret;
++	MFT_REF ino;
++	ntfs_inode *idst;
++	char *src, *dir, *sname, *dname, *path, *tmp;
++
++	ret   = 1;
++	idst  = NULL;
++	*dst  = NULL;
++	src   = NULL;
++	dir   = NULL;
++	sname = NULL;
++	dname = NULL;
++	path  = NULL;
++	ino   = dst_ino;
++
++	ntfs_log_trace("Entering for 0x%llx %s\n", dst_ino, _src);
++
++	src = ntfsutil_strdup(_src);
++	if (!src)
++		goto out;
++
++	while (MREF(ino) != FILE_root) {
++		int rc;
++
++		if (strcmp(src, "/"))
++			if (ntfsutil_path_split(src, &dir, &sname))
++				goto out;
++
++		idst = ntfs_inode_open(ctx->dst.vol, MREF(ino));
++		if (!idst) {
++			ntfs_log_perror("opening 0x%llx", ino);
++			goto out;
++		}
++
++		if (ntfsutil_cp_find_filename(ctx, idst,
++					      sname, &dname, &ino)) {
++			ntfs_log_perror("searching for file name");
++			goto out;
++		}
++
++		if (strcmp(src, "/")) {
++			free(src);
++			src = dir;
++			dir = NULL;
++		}
++
++		tmp = path;
++		rc = asprintf(&path, "/%s%s", dname, (tmp ? : ""));
++		free(tmp);
++
++		if (rc == -1) {
++			path = NULL;
++			goto out;
++		}
++
++		free(sname);
++		free(dname);
++		ntfs_inode_close(idst);
++		sname = NULL;
++		dname = NULL;
++		idst  = NULL;
++	}
++
++	if (!path) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	if (ntfs_pathname_to_inode_num(ctx->dst.vol, NULL, path) != dst_ino) {
++		errno = ENOENT;
++		ntfs_log_perror("%s mis-mapped to %s", _src, path);
++		goto out;
++	}
++
++	for (tmp = path; *tmp; tmp++)
++		if (*tmp == '/')
++			*tmp = '\\';
++
++	tmp = path;
++	ret = asprintf(&path, "\\??\\%s%s", ctx->opts.vol_id, path);
++	free(tmp);
++	if (ret == -1) {
++		ret = 1;
++		path = NULL;
++		goto out;
++	}
++
++	ret  = 0;
++	*dst = path;
++
++out:
++	free(dir);
++	free(sname);
++	free(dname);
++	if (idst)
++		ntfs_inode_close(idst);
++	if (ret)
++		free(path);
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * reparse points are handled as follows:
++ *  - all non-reparse files are copied first
++ *  - all source reparse files are checked to verify that
++ *    the targets which they reference were copied
++ *  - all destination reparse files are updated to refer to
++ *    the destination reparse targets
++ */
++static int
++ntfsutil_cp_update_reparse_point(struct ntfsutil_cp_ctx *ctx,
++				 struct ntfsutil_cp_inos *ino)
++{
++	le32 type;
++	int ret, i;
++	size_t size;
++	REPARSE_POINT *drp;
++	char *vol, *src, *dst;
++	struct ntfsutil_cp_ino_map *map;
++	ntfs_inode *isrc, *isrc_tgt, *idst;
++
++	ret      = 1;
++	vol      = NULL;
++	src      = NULL;
++	dst      = NULL;
++	isrc     = NULL;
++	isrc_tgt = NULL;
++	idst     = NULL;
++	drp      = NULL;
++	map      = &ctx->ino_map;
++
++	ntfs_log_trace("Entering for 0x%llx\n", ino->src);
++
++	isrc = ntfs_inode_open(ctx->src.vol, ino->src);
++	if (!isrc) {
++		ntfs_log_perror("opening reparse point 0x%llx", ino->src);
++		goto out;
++	}
++
++	if (ntfs_read_reparse_path(isrc, &type, &vol, &src))
++		goto out;
++
++	isrc_tgt = ntfs_pathname_to_inode(ctx->src.vol, NULL, src);
++	if (!isrc_tgt) {
++		ntfs_log_perror("opening reparse target %s", src);
++		goto out;
++	}
++
++	idst = ntfs_inode_open(ctx->dst.vol, ino->dst);
++	if (!idst) {
++		ntfs_log_perror("opening reparse point 0x%llx", ino->dst);
++		goto out;
++	}
++
++	for (i = 0; i < map->cnt; i++)
++		if (map->inos[i].src == isrc_tgt->mft_no)
++			break;
++
++	if (i == map->cnt) {
++		char *p;
++
++		if (!ctx->opts.reparse_copy) {
++			/*
++			 * disregard this reparse point
++			 */
++			ntfs_log_info("disregarding reparse point "
++				      "%s:%s\n", vol, src);
++			goto done;
++		}
++
++		/*
++		 * fault in reparse target
++		 */
++		ntfs_log_info("copying external reparse target %s\n", src);
++
++		if (ntfsutil_cp_reparse_target(ctx, src))
++			goto out;
++
++		for (p = src; *p; p++)
++			if (*p == '/')
++				*p = '\\';
++
++		if (asprintf(&dst, "\\??\\%s%s", ctx->opts.vol_id, src) == -1) {
++			dst = NULL;
++			goto out;
++		}
++
++	} else if (ntfsutil_cp_map_reparse_path(ctx,
++						map->inos[i].dst, src, &dst))
++		goto out;
++
++	/*
++	 * we always create mount point reparse points
++	 */
++	if (ntfs_allocate_reparse_mount_point(dst, &drp, &size))
++		goto out;
++
++	if (ntfs_set_reparse_point(NULL, idst, drp)) {
++		ntfs_log_perror("creating reparse point");
++		goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	free(src);
++	free(dst);
++	free(drp);
++	free(vol);
++	if (isrc)
++		ntfs_inode_close(isrc);
++	if (isrc_tgt)
++		ntfs_inode_close(isrc_tgt);
++	if (idst)
++		ntfs_inode_close(idst);
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * we have a few options when dealing with reparse points:
++ *   --preserve-reparse copies the reparse attribute from src to dst as is,
++ *     updating the dst reparse index on the way.  this is sufficient when
++ *     the dst dir will replace the src dir via a new mount point.
++ *   --update-reparse copies src reparse paths to dst, but updates the volume
++ *     identifier of the dst path to reflect its location on a new volume.
++ *   --copy-reparse ensures that the target directories of any reparse points
++ *     included in the src tree are moved onto the dst volume as well.
++ */
++static int
++ntfsutil_cp_update_reparse_points(struct ntfsutil_cp_ctx *ctx)
++{
++	int i, ret;
++	struct ntfsutil_cp_ino_map *map;
++
++	ret = 1;
++	map = &ctx->ino_map;
++
++	if (!ctx->opts.reparse_update)
++		goto done;
++
++	for (i = 0; i < map->cnt; i++) {
++		if (!(map->inos[i].flags & FILE_ATTR_REPARSE_POINT))
++			continue;
++
++		if (ntfsutil_cp_update_reparse_point(ctx, map->inos + i))
++			goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	return ret;
++}
++
++/*
++ * resize dst $Secure to that of src $Secure
++ *
++ * when preserving metadata (and thus security descriptors), we tend
++ * to make a large number of small writes to $Secure (one per sd).  this leads
++ * to a fragmented runlist.  at the moment, libntfs doesn't have very good
++ * support for fragmented runlists.  so extend the file now in one fell swoop,
++ * giving us a nice compact runlist.  FIXME.
++ */
++static int
++ntfsutil_cp_truncate_secure(struct ntfsutil_cp_ctx *ctx)
++{
++	int ret, err;
++	ntfs_attr *asrc, *adst;
++	ntfs_inode *isrc, *idst;
++
++	ret  = 1;
++	asrc = NULL;
++	adst = NULL;
++	isrc = NULL;
++	idst = NULL;
++
++	isrc = ntfs_inode_open(ctx->src.vol, MREF(FILE_Secure));
++	if (!isrc) {
++		ntfs_log_perror("opening src $Secure");
++		goto out;
++	}
++
++	asrc = ntfs_attr_open(isrc, AT_DATA, NTFS_ATTR_SDS, 4);
++	if (!asrc) {
++		ntfs_log_perror("opening src $SDS");
++		goto out;
++	}
++
++	idst = ntfs_inode_open(ctx->dst.vol, MREF(FILE_Secure));
++	if (!idst) {
++		ntfs_log_perror("opening dst $Secure");
++		goto out;
++	}
++
++	adst = ntfs_attr_open(idst, AT_DATA, NTFS_ATTR_SDS, 4);
++	if (!adst) {
++		ntfs_log_perror("opening dst $SDS");
++		goto out;
++	}
++
++	if (adst->allocated_size >= asrc->allocated_size * 2)
++		goto done;
++
++	if (__ntfs_attr_truncate(adst, asrc->allocated_size * 2, FALSE)) {
++		ntfs_log_perror("truncating dst $SDS");
++		goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	err = errno;
++	if (asrc)
++		ntfs_attr_close(asrc);
++	if (adst)
++		ntfs_attr_close(adst);
++	if (isrc)
++		ntfs_inode_close(isrc);
++	if (idst)
++		ntfs_inode_close(idst);
++	errno = err;
++	return ret;
++}
++
++static int
++ntfsutil_start_cp(struct ntfsutil_cp_ctx *ctx)
++{
++	int ret;
++	char *src, *src_dir, *dst, *dst_dir;
++	ntfs_inode *isrc, *isrc_dir, *idst, *idst_dir;
++
++	ret      = 1;
++	src      = NULL;
++	src_dir  = NULL;
++	dst      = NULL;
++	dst_dir  = NULL;
++	isrc     = NULL;
++	isrc_dir = NULL;
++	idst     = NULL;
++	idst_dir = NULL;
++
++#ifdef NTFSUTIL_CP_SECURE_SDS
++	if (ctx->opts.preserve && strcmp(ctx->src.image, ctx->dst.image)) {
++		if (ntfsutil_cp_truncate_secure(ctx)) {
++			ntfs_log_perror("truncating $Secure");
++			goto out;
++		}
++	}
++#endif
++
++	if (ctx->filter) {
++		if (!(dst_dir = ntfsutil_strdup(ctx->dst.path)))
++			goto out;
++
++		/*
++		 * when working with filters, we need to start in the dir
++		 * of the first path element without a wildcard
++		 *
++		 * TODO: handle arbitry wildcard placement
++		 * (rather than just at end of path)
++		 */
++		if (ntfsutil_path_split(ctx->src.path, &src_dir, NULL))
++			goto out;
++
++		isrc_dir = ntfs_pathname_to_inode(ctx->src.vol, NULL, src_dir);
++		if (!isrc_dir) {
++			ntfs_log_perror("opening source %s", src_dir);
++			goto out;
++		}
++
++		ret = ntfsutil_cp_directory_contents(ctx, isrc_dir,
++						     src_dir, dst_dir);
++		goto out;
++	}
++
++	isrc = ntfs_pathname_to_inode(ctx->src.vol, NULL, ctx->src.path);
++	if (!isrc) {
++		ntfs_log_perror("opening source %s", ctx->src.path);
++		goto out;
++	}
++
++	if (!ctx->opts.recursive &&
++	    isrc->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
++		errno = EISDIR;
++		ntfs_log_perror("%s is a directory", ctx->src.path);
++		goto out;
++	}
++
++	idst = ntfs_pathname_to_inode(ctx->dst.vol, NULL, ctx->dst.path);
++	if (!idst && errno == ENOENT) {
++		if (isrc->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
++			/*
++			 * assume dst is new directory name
++			 */
++			if (ntfsutil_path_split(ctx->dst.path, &dst_dir, &dst))
++				goto out;
++
++			if (ntfsutil_path_split(ctx->src.path, &src_dir, &src))
++				goto out;
++
++			isrc_dir = ntfs_pathname_to_inode(ctx->src.vol,
++							  NULL, src_dir);
++			if (!isrc_dir) {
++				ntfs_log_perror("Opening %s", src_dir);
++				goto out;
++			}
++
++			idst_dir = ntfs_pathname_to_inode(ctx->dst.vol,
++							  NULL, dst_dir);
++			if (!idst_dir) {
++				ntfs_log_perror("Opening %s", dst_dir);
++				goto out;
++			}
++
++			idst = ntfsutil_new_file(ctx, src, dst, S_IFDIR,
++						 isrc_dir, isrc, idst_dir);
++			if (!idst) {
++				ntfs_log_perror("Creating %s", ctx->dst.path);
++				goto out;
++			}
++
++			ret = ntfsutil_cp_directory_contents(ctx, isrc,
++							     ctx->src.path,
++							     ctx->dst.path);
++			goto out;
++		} else {
++			/*
++			 * assume dst is new file name, and use dirname(dst)
++			 */
++			if (ntfsutil_path_split(ctx->dst.path, &dst_dir, &dst))
++				goto out;
++		}
++	} else if (!idst) {
++		ntfs_log_perror("Opening %s", ctx->dst.path);
++		goto out;
++	} else if (!(dst_dir = ntfsutil_strdup(ctx->dst.path))) {
++		goto out;
++	}
++
++	if (!(src = ntfsutil_strdup(ctx->src.path)))
++		goto out;
++
++	ret = ntfsutil_cp_path(ctx, src, dst_dir, dst);
++
++out:
++	if (!ret)
++		ret = ntfsutil_cp_update_reparse_points(ctx);
++	free(src);
++	free(dst);
++	free(src_dir);
++	free(dst_dir);
++	if (isrc)
++		ntfs_inode_close(isrc);
++	if (isrc_dir)
++		ntfs_inode_close(isrc_dir);
++	if (idst)
++		ntfs_inode_close(idst);
++	if (idst_dir)
++		ntfs_inode_close(idst_dir);
++	return ret;
++}
++
++/**
++ * ntfsutil_cp() - copy ntfs files
++ *
++ * returns 0 on success or 1 on failure with errno set
++ */
++int
++_ntfsutil_cp(struct ntfsutil_cp_options *opts)
++{
++	int ret, i, n, flags;
++	struct ntfsutil_cp_ctx ctx;
++
++	ret = 1;
++
++	memset(&ctx, 0, sizeof(ctx));
++	memcpy(&ctx.opts, opts, sizeof(*opts));
++
++	ntfs_log_trace("Entering.\n");
++
++	if (ntfsutil_cp_map_initialize(&ctx))
++		goto out;
++
++	if (ntfsutil_parse_target(ctx.opts.src, &ctx.src)) {
++		ntfs_log_error("failed parsing target %s\n", ctx.opts.src);
++		goto out;
++	}
++
++	if (ntfsutil_parse_target(ctx.opts.dst, &ctx.dst)) {
++		ntfs_log_error("failed parsing target %s\n", ctx.opts.dst);
++		goto out;
++	}
++
++	/*
++	 * for now we only support copies from ntfs to ntfs
++	 */
++	if (!ctx.src.image || !ctx.dst.image) {
++		errno = EINVAL;
++		ntfs_log_error("only ntfs to ntfs copies supported\n");
++		goto out;
++	}
++
++	n = strlen(ctx.src.path);
++	for (i = 0; i < n; i++) {
++		if (strchr("*[]?", ctx.src.path[i])) {
++			ctx.filter = ctx.src.path;
++			break;
++		}
++	}
++
++	/* Set SIGINT handler. */
++	if (signal(SIGINT, signal_handler) == SIG_ERR) {
++		ntfs_log_perror("Failed to set SIGINT handler");
++		goto out;
++	}
++	/* Set SIGTERM handler. */
++	if (signal(SIGTERM, signal_handler) == SIG_ERR) {
++		ntfs_log_perror("Failed to set SIGTERM handler");
++		goto out;
++	}
++
++	flags = (ctx.opts.force_mount ? NTFS_MNT_FORCE : 0);
++	ctx.src.vol = utils_mount_volume(ctx.src.image,
++					 NTFS_MNT_RDONLY | flags);
++	if (!ctx.src.vol)
++		goto out;
++
++	ctx.dst.vol = utils_mount_volume(ctx.dst.image, flags);
++	if (!ctx.dst.vol)
++		goto out;
++
++	ret = ntfsutil_start_cp(&ctx);
++
++out:
++	ntfsutil_cp_map_free(&ctx);
++
++	if (ctx.src.vol)
++		ntfs_umount(ctx.src.vol, FALSE);
++	if (ctx.dst.vol)
++		ntfs_umount(ctx.dst.vol, FALSE);
++
++	free(ctx.src.image);
++	free(ctx.src.path);
++	free(ctx.dst.image);
++	free(ctx.dst.path);
++
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++/**
++ * ntfsutil_cp()
++ *
++ * parse commmand line options and return _ntfsutil_cp()
++ */
++int
++ntfsutil_cp(int argc, char *argv[])
++{
++	int ret;
++	struct ntfsutil_cp_options opts;
++
++	ret = 1;
++	memset(&opts, 0, sizeof(opts));
++
++	if (parse_options(&opts, argc, argv)) {
++		if (!errno)
++			ret = 0;
++		goto out;
++	}
++
++	ret = _ntfsutil_cp(&opts);
++
++out:
++	return ret;
++}
+diff --git a/ntfsprogs/ntfsutil.c b/ntfsprogs/ntfsutil.c
+index 9806d31..64f3721 100644
+--- a/ntfsprogs/ntfsutil.c
++++ b/ntfsprogs/ntfsutil.c
+@@ -48,6 +48,7 @@ struct command {
+ };
+ 
+ static struct command commands[] = {
++	{ .name = "cp",        .func = ntfsutil_cp },
+ 	{ .name = "rm",        .func = ntfsutil_rm },
+ 	{ .name = "mkdir",     .func = ntfsutil_mkdir },
+ 	{ .name = "reparse",   .func = ntfsutil_reparse },
+diff --git a/ntfsprogs/ntfsutil.h b/ntfsprogs/ntfsutil.h
+index e5558bb..2913e09 100644
+--- a/ntfsprogs/ntfsutil.h
++++ b/ntfsprogs/ntfsutil.h
+@@ -66,4 +66,22 @@ struct ntfsutil_dump_options {
+ int ntfsutil_dump(int, char **);
+ int _ntfsutil_dump(struct ntfsutil_dump_options *);
+ 
++struct ntfsutil_cp_options {
++	char	 	            *src;	  /* source volume:path */
++	char		            *dst;	  /* destination volume:path */
++	int                          recursive;   /* Recursive copy */
++	int                          interactive; /* Warn on clobber */
++	int                          system;      /* Copy system files */
++	int                          preserve;    /* Preserve metadata */
++	int                          reparse_preserve;     /* Preserve reparse points */
++	int                          reparse_update;       /* Update reparse points */
++	int                          reparse_copy;         /* Copy external reparse points */
++	char                        *vol_id;      /* Volume identifier */
++	int                          force;       /* Delete extant dst files */
++	int                          force_mount; /* Mount dirty volumes */
++};
++
++int ntfsutil_cp(int, char **);
++int _ntfsutil_cp(struct ntfsutil_cp_options *);
++
+ #endif /* _NTFSUTIL_H_ */

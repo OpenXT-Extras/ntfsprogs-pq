@@ -1,0 +1,82 @@
+diff --git a/libntfs/collate.c b/libntfs/collate.c
+index a63c405..620a78a 100644
+--- a/libntfs/collate.c
++++ b/libntfs/collate.c
+@@ -102,6 +102,59 @@ static int ntfs_collate_ntofs_ulong(ntfs_volume *vol __attribute__((unused)),
+ }
+ 
+ /**
++ * ntfs_collate_ntofs_ulongs - Which of two long ints should be listed first
++ * @vol: unused
++ * @data1:
++ * @data1_len:
++ * @data2:
++ * @data2_len:
++ *
++ * Description...
++ *
++ * Returns:
++ */
++static int ntfs_collate_ntofs_ulongs(ntfs_volume *vol __attribute__((unused)),
++		const void *data1, size_t data1_len,
++		const void *data2, size_t data2_len)
++{
++	int rc;
++	u32 d1, d2, *p1, *p2;
++
++	ntfs_log_trace("Entering.\n");
++	if (data1_len < 3 || data2_len < 3 ||
++	    (data1_len & 3) || (data2_len & 3)) {
++		ntfs_log_error("data_len invalid\n");
++		return NTFS_COLLATION_ERROR;
++	}
++
++	p1 = (u32 *)data1;
++	p2 = (u32 *)data2;
++
++	while (data1_len && data2_len) {
++		d1 = le32_to_cpup(p1);
++		d2 = le32_to_cpup(p2);
++		if (d1 != d2) {
++			rc = (d1 < d2 ? -1 : 1);
++			goto done;
++		}
++
++		p1++;
++		p2++;
++		data1_len -= sizeof(*p1);
++		data2_len -= sizeof(*p2);
++	}
++
++	if (!data1_len && !data2_len)
++		rc = 0;
++	else
++		rc = (data2_len ? -1 : 1);
++
++done:
++	ntfs_log_trace("Done, returning %i.\n", rc);
++	return rc;
++}
++
++/**
+  * ntfs_collate_file_name - Which of two filenames should be listed first
+  * @vol:
+  * @data1:
+@@ -143,7 +196,7 @@ static ntfs_collate_func_t ntfs_do_collate0x1[4] = {
+ 	ntfs_collate_ntofs_ulong,
+ 	NULL/*ntfs_collate_ntofs_sid*/,
+ 	NULL/*ntfs_collate_ntofs_security_hash*/,
+-	NULL/*ntfs_collate_ntofs_ulongs*/,
++	ntfs_collate_ntofs_ulongs,
+ };
+ 
+ /**
+@@ -160,7 +213,7 @@ static ntfs_collate_func_t ntfs_do_collate0x1[4] = {
+ BOOL ntfs_is_collation_rule_supported(COLLATION_RULES cr)
+ {
+ 	return (cr == COLLATION_BINARY || cr == COLLATION_NTOFS_ULONG ||
+-			cr == COLLATION_FILE_NAME);
++		cr == COLLATION_FILE_NAME || cr == COLLATION_NTOFS_ULONGS);
+ 	/*
+ 	 * FIXME:  At the moment we only support COLLATION_BINARY,
+ 	 * COLLATION_NTOFS_ULONG and COLLATION_FILE_NAME.

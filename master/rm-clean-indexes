@@ -1,0 +1,307 @@
+diff --git a/include/ntfs/Makefile.am b/include/ntfs/Makefile.am
+index e1bc82d..7633511 100644
+--- a/include/ntfs/Makefile.am
++++ b/include/ntfs/Makefile.am
+@@ -25,6 +25,7 @@ linux_ntfsinclude_HEADERS = \
+ 	logging.h		\
+ 	mft.h			\
+ 	mst.h			\
++	object.h		\
+ 	ntfstime.h		\
+ 	reparse.h		\
+ 	runlist.h		\
+diff --git a/include/ntfs/object.h b/include/ntfs/object.h
+new file mode 100644
+index 0000000..d5b6947
+--- /dev/null
++++ b/include/ntfs/object.h
+@@ -0,0 +1,32 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program (in the main directory of the NTFS-3G
++ * distribution in the file COPYING); if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#ifndef OBJECT_H
++#define OBJECT_H
++
++#include "layout.h"
++#include "inode.h"
++
++#define OBJECT_INDEX "$Extend/$ObjId"
++
++typedef struct {
++	GUID guid;
++} __attribute__((__packed__)) OBJECT_INDEX_KEY;
++
++int ntfs_clear_object_index(ntfs_inode *);
++
++#endif
+diff --git a/include/ntfs/reparse.h b/include/ntfs/reparse.h
+index 198828a..cafa7a0 100644
+--- a/include/ntfs/reparse.h
++++ b/include/ntfs/reparse.h
+@@ -89,6 +89,7 @@ int ntfs_remove_ntfs_reparse_data(const char *path, ntfs_inode *ni);
+ 
+ int ntfs_set_reparse_point(const char *path, ntfs_inode *ni, REPARSE_POINT *point);
+ int ntfs_update_reparse_index(ntfs_inode *ni, REPARSE_POINT *point);
++int ntfs_clear_reparse_index(ntfs_inode *ni);
+ 
+ int ntfs_extract_reparse_data(REPARSE_POINT *rp, char **data);
+ int ntfs_parse_reparse_path(const char *data, char **vol, char **path);
+diff --git a/libntfs/Makefile.am b/libntfs/Makefile.am
+index 33c4d95..2a92a80 100644
+--- a/libntfs/Makefile.am
++++ b/libntfs/Makefile.am
+@@ -63,6 +63,7 @@ libntfs_la_SOURCES =	\
+ 	misc.c		\
+ 	mft.c		\
+ 	mst.c		\
++	object.c	\
+ 	reparse.c	\
+ 	runlist.c	\
+ 	security.c	\
+diff --git a/libntfs/dir.c b/libntfs/dir.c
+index 6b1ed32..0ca85a0 100644
+--- a/libntfs/dir.c
++++ b/libntfs/dir.c
+@@ -53,6 +53,8 @@
+ #include "ntfstime.h"
+ #include "lcnalloc.h"
+ #include "logging.h"
++#include "reparse.h"
++#include "object.h"
+ 
+ /*
+  * The little endian Unicode strings "$I30", "$SII", "$SDH", "$O"
+@@ -1648,6 +1650,12 @@ search:
+ 	 */
+ 	if (ni->mrec->link_count)
+ 		goto out;
++
++	if (ni->flags & FILE_ATTR_REPARSE_POINT)
++		ntfs_clear_reparse_index(ni); /* ignore errors */
++
++	ntfs_clear_object_index(ni); /* ignore errors */
++
+ 	ntfs_attr_reinit_search_ctx(actx);
+ 	while (!ntfs_attrs_walk(actx)) {
+ 		if (actx->attr->non_resident) {
+diff --git a/libntfs/object.c b/libntfs/object.c
+new file mode 100644
+index 0000000..2181ebf
+--- /dev/null
++++ b/libntfs/object.c
+@@ -0,0 +1,112 @@
++/*
++ * object.c - Processing of $ObjId
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program (in the main directory of the Linux-NTFS
++ * distribution in the file COPYING); if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#ifdef HAVE_ERRNO_H
++#include <errno.h>
++#endif
++
++#include "types.h"
++#include "attrib.h"
++#include "inode.h"
++#include "dir.h"
++#include "index.h"
++#include "object.h"
++#include "logging.h"
++
++int
++ntfs_clear_object_index(ntfs_inode *ni)
++{
++	int ret;
++	ntfs_inode *index_ni;
++	OBJECT_ID_ATTR *attr;
++	OBJECT_INDEX_KEY key;
++	ntfs_index_context *ictx;
++	ntfs_attr_search_ctx *actx;
++
++	ntfs_log_trace("Entering.\n");
++
++	ret      = -1;
++	ictx     = NULL;
++	actx     = NULL;
++	index_ni = NULL;
++
++	if (!ni) {
++		errno = EINVAL;
++		ntfs_log_perror("invalid arguments");
++		goto out;
++	}
++
++	actx = ntfs_attr_get_search_ctx(ni, NULL);
++	if (!actx) {
++		ntfs_log_perror("getting attr context");
++		goto out;
++	}
++
++	if (ntfs_attr_lookup(AT_OBJECT_ID, NULL, 0,
++			     IGNORE_CASE, 0, NULL, 0, actx)) {
++		if (errno == ENOENT)
++			ret = 0;
++		else
++			ntfs_log_perror("finding object attr");
++		goto out;
++	}
++
++	index_ni = ntfs_pathname_to_inode(ni->vol, NULL, OBJECT_INDEX);
++	if (!index_ni) {
++		ntfs_log_perror("opening object index");
++		goto out;
++	}
++
++	ictx = ntfs_index_ctx_get(index_ni, NTFS_INDEX_O, 2);
++	if (!ictx) {
++		ntfs_log_perror("getting index context");
++		goto out;
++	}
++
++	attr = (OBJECT_ID_ATTR *)
++		((u8 *)actx->attr + le16_to_cpu(actx->attr->value_offset));
++
++	key.guid = attr->object_id;
++
++	if (!ntfs_index_lookup(&key, sizeof(key), ictx)) {
++		if (ntfs_index_rm(ictx)) {
++			ntfs_log_perror("removing object index");
++			goto out;
++		}
++	} else {
++		ntfs_log_perror("finding object index for 0x%llx",
++				ni->mft_no);
++		goto out;
++	}
++
++	ret = 0;
++
++out:
++	if (actx)
++		ntfs_attr_put_search_ctx(actx);
++	if (ictx)
++		ntfs_index_ctx_put(ictx);
++	if (index_ni)
++		ntfs_inode_close(index_ni);
++	return ret;
++}
+diff --git a/libntfs/reparse.c b/libntfs/reparse.c
+index 4c40263..61cdf75 100644
+--- a/libntfs/reparse.c
++++ b/libntfs/reparse.c
+@@ -1111,6 +1111,84 @@ out:
+ 	return ret;
+ }
+ 
++int
++ntfs_clear_reparse_index(ntfs_inode *ni)
++{
++	int ret, size;
++	REPARSE_POINT *point;
++	ntfs_inode *index_ni;
++	REPARSE_INDEX_KEY key;
++	ntfs_index_context *ictx;
++
++	ntfs_log_trace("Entering.\n");
++
++	ret      = -1;
++	ictx     = NULL;
++	index_ni = NULL;
++	point    = NULL;
++
++	if (!ni || !(ni->flags & FILE_ATTR_REPARSE_POINT)) {
++		errno = EINVAL;
++		ntfs_log_perror("invalid arguments\n");
++		goto out;
++	}
++
++	size = ntfs_get_ntfs_reparse_data(NULL, NULL, 0, ni);
++	if (size < 0) {
++		errno = -size;
++		ntfs_log_perror("reading reparse data");
++		goto out;
++	}
++
++	point = ntfs_malloc(size);
++	if (!point)
++		goto out;
++
++	size = ntfs_get_ntfs_reparse_data(NULL, (char *)point, size, ni);
++	if (size < 0) {
++		errno = -size;
++		ntfs_log_perror("reading reparse data");
++		goto out;
++	}
++
++	index_ni = ntfs_pathname_to_inode(ni->vol, NULL, REPARSE_INDEX);
++	if (!index_ni) {
++		ntfs_log_perror("opening reparse index");
++		goto out;
++	}
++
++	ictx = ntfs_index_ctx_get(index_ni, NTFS_INDEX_R, 2);
++	if (!ictx) {
++		ntfs_log_perror("getting index context");
++		goto out;
++	}
++
++	key.reparse_tag = point->reparse_tag;
++	key.file_id     = MK_MREF(ni->mft_no,
++				  le16_to_cpu(ni->mrec->sequence_number));
++
++	if (!ntfs_index_lookup(&key, sizeof(key), ictx)) {
++		if (ntfs_index_rm(ictx)) {
++			ntfs_log_perror("removing reparse index");
++			goto out;
++		}
++	} else {
++		ntfs_log_perror("finding reparse index for 0x%llx",
++				ni->mft_no);
++		goto out;
++	}
++
++	ret = 0;
++
++out:
++	if (ictx)
++		ntfs_index_ctx_put(ictx);
++	if (index_ni)
++		ntfs_inode_close(index_ni);
++	free(point);
++	return ret;
++}
++
+ /*
+  * set a reparse point on a directory
+  *

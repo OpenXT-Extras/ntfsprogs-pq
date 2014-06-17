@@ -1,0 +1,342 @@
+diff --git a/include/ntfs/index.h b/include/ntfs/index.h
+index 14be05c..ba34495 100644
+--- a/include/ntfs/index.h
++++ b/include/ntfs/index.h
+@@ -114,6 +114,7 @@ extern void ntfs_index_ctx_reinit(ntfs_index_context *ictx);
+ 
+ extern int ntfs_index_lookup(const void *key, const int key_len,
+ 		ntfs_index_context *ictx);
++extern int ntfs_index_iterate_next(ntfs_index_context *ictx);
+ 
+ extern int ntfs_index_add_filename(ntfs_inode *ni, FILE_NAME_ATTR *fn,
+ 		MFT_REF mref);
+diff --git a/libntfs/index.c b/libntfs/index.c
+index 4d7177a..d1daec6 100644
+--- a/libntfs/index.c
++++ b/libntfs/index.c
+@@ -227,6 +227,11 @@ static int ntfs_ie_end(INDEX_ENTRY *ie)
+ 	return (ie->flags & INDEX_ENTRY_END) ? 1 : 0;
+ }
+ 
++static int ntfs_ie_has_subnode(INDEX_ENTRY *ie)
++{
++	return (ie->flags & INDEX_ENTRY_NODE) ? 1 : 0;
++}
++
+ /**
+  *  Find the last entry in the index block
+  */
+@@ -252,6 +257,22 @@ static INDEX_ENTRY *ntfs_ie_get_by_pos(INDEX_HEADER *ih, int pos)
+ 	return ie;
+ }
+ 
++static int ntfs_ie_get_pos(INDEX_HEADER *ih, INDEX_ENTRY *ie)
++{
++	int pos;
++	INDEX_ENTRY *i;
++
++	i   = ntfs_ie_get_first(ih);
++	pos = 0;
++
++	while (i != ie) {
++		pos++;
++		i = ntfs_ie_get_next(i);
++	}
++
++	return pos;
++}
++
+ static INDEX_ENTRY *ntfs_ie_prev(INDEX_HEADER *ih, INDEX_ENTRY *ie)
+ {
+ 	INDEX_ENTRY *ie_prev, *tmp;
+@@ -268,6 +289,11 @@ static INDEX_ENTRY *ntfs_ie_prev(INDEX_HEADER *ih, INDEX_ENTRY *ie)
+ 	return ie_prev;
+ }
+ 
++static INDEX_HEADER *ntfs_icx_get_header(ntfs_index_context *icx)
++{
++	return (icx->is_in_root ? &icx->ir->index : &icx->ib->index);
++}
++
+ char *ntfs_ie_filename_get(INDEX_ENTRY *ie)
+ {
+ 	FILE_NAME_ATTR *fn;
+@@ -801,6 +827,278 @@ done:
+ 	return 0;
+ }
+ 
++static int
++ntfs_index_load_root(ntfs_index_context *icx)
++{
++	int ret;
++	INDEX_ROOT *ir;
++	ntfs_attr_search_ctx *actx;
++
++	ret = -1;
++	ir  = NULL;
++
++	ntfs_log_trace("Entering.\n");
++
++	ir = ntfs_ir_lookup(icx->ni, icx->name, icx->name_len, &actx);
++	if (!ir) {
++		if (errno == ENOENT)
++			errno = EIO;
++		goto out;
++	}
++
++	icx->type = ir->type;
++
++	icx->block_size = le32_to_cpu(ir->index_block_size);
++	if (icx->block_size < NTFS_BLOCK_SIZE) {
++		errno = EINVAL;
++		ntfs_log_perror("Index block size (%u) is smaller than the "
++				"sector size (%d)", (unsigned)icx->block_size,
++				NTFS_BLOCK_SIZE);
++		goto out;
++	}
++
++	if (icx->ni->vol->cluster_size <= icx->block_size)
++		icx->vcn_size_bits = icx->ni->vol->cluster_size_bits;
++	else
++		icx->vcn_size_bits = icx->ni->vol->sector_size_bits;
++
++	icx->cr = ir->collation_rule;
++	if (!ntfs_is_collation_rule_supported(icx->cr)) {
++		errno = EOPNOTSUPP;
++		ntfs_log_perror("Unknown collation rule 0x%x",
++				(unsigned)le32_to_cpu(icx->cr));
++		goto out;
++	}
++
++	icx->actx            = actx;
++	icx->ir              = ir;
++	icx->is_in_root      = TRUE;
++	icx->pindex          = 0;
++	icx->ib_vcn          = VCN_INDEX_ROOT_PARENT;
++	icx->parent_vcn[0]   = VCN_INDEX_ROOT_PARENT;
++	ret                  = 0;
++
++out:
++	if (ret == -1) {
++		if (ir)
++			ntfs_attr_put_search_ctx(actx);
++	}
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * descend to subnode
++ * @entry will reference the first entry in the subnode
++ */
++static int
++ntfs_index_descend(ntfs_index_context *icx)
++{
++	VCN vcn;
++	int ret, pos;
++	INDEX_HEADER *ih;
++
++	ret = -1;
++	ntfs_log_trace("Entering.\n");
++
++	if (!icx || !icx->entry || (!icx->ir && !icx->ib) ||
++	    !ntfs_ie_has_subnode(icx->entry)) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	ih = ntfs_icx_get_header(icx);
++	if (!icx->is_in_root && (ih->flags & NODE_MASK) == LEAF_NODE) {
++		errno = EIO;
++		ntfs_log_error("Index entry with child node found in a leaf "
++			       "node in inode 0x%llx.\n",
++			       (unsigned long long)icx->ni->mft_no);
++		goto out;
++	}
++
++	icx->is_in_root = FALSE;
++	icx->ir         = NULL;
++
++	pos = ntfs_ie_get_pos(ih, icx->entry);
++	vcn = ntfs_ie_get_vcn(icx->entry);
++	if (vcn < 0) {
++		errno = EINVAL;
++		ntfs_log_perror("Negative vcn in inode %llu\n",
++				icx->ni->mft_no);
++		goto out;
++	}
++
++	if (!icx->ia_na) {
++		icx->ia_na = ntfs_ia_open(icx, icx->ni);
++		if (!icx->ia_na)
++			goto out;
++	}
++
++	if (!icx->ib) {
++		icx->ib = ntfs_malloc(icx->block_size);
++		if (!icx->ib)
++			goto out;
++	}
++
++	if (ntfs_icx_parent_inc(icx))
++		goto out;
++
++	icx->parent_pos[icx->pindex - 1] = pos;
++	icx->parent_vcn[icx->pindex] = vcn;
++
++	if (ntfs_ib_read(icx, vcn, icx->ib)) {
++		errno = EIO;
++		goto out;
++	}
++
++	icx->ib_vcn = vcn;
++	icx->entry = ntfs_ie_get_first(&icx->ib->index);
++	ret = 0;
++
++out:
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * ascend to parent node
++ * @index will reference the next unvisited entry
++ * errno == ENOENT indicates end of index
++ */
++static int
++ntfs_index_ascend(ntfs_index_context *icx)
++{
++	int ret;
++
++	ret = -1;
++	ntfs_log_trace("Entering.\n");
++
++	if (!icx || !icx->entry || !ntfs_ie_end(icx->entry)) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	if (icx->is_in_root) {
++		errno = ENOENT;
++		goto out;
++	}
++
++	if (ntfs_icx_parent_dec(icx))
++		goto out;
++
++	if (!icx->pindex) {
++		free(icx->ib);
++		icx->ib = NULL;
++
++		if (ntfs_index_load_root(icx))
++			goto out;
++
++	} else if (ntfs_ib_read(icx, icx->parent_vcn[icx->pindex], icx->ib)) {
++		errno = EIO;
++		goto out;
++	}
++
++	icx->ib_vcn = icx->parent_vcn[icx->pindex];
++	icx->entry = ntfs_ie_get_by_pos(ntfs_icx_get_header(icx),
++					icx->parent_pos[icx->pindex]);
++	ret = 0;
++
++out:
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++static int
++__ntfs_index_iterate_next(ntfs_index_context *icx)
++{
++	int ret;
++
++	ret = -1;
++	ntfs_log_trace("Entering.\n");
++
++	do {
++		if (!icx->entry)
++			icx->entry = ntfs_ie_get_first(&icx->ir->index);
++		else if (!ntfs_ie_end(icx->entry))
++			icx->entry = ntfs_ie_get_next(icx->entry);
++
++		if (ntfs_ie_has_subnode(icx->entry)) {
++
++			do {
++				if (ntfs_index_descend(icx))
++					goto out;
++
++			} while (ntfs_ie_has_subnode(icx->entry));
++
++		} else if (ntfs_ie_end(icx->entry)) {
++
++			do {
++				if (ntfs_index_ascend(icx))
++					goto out;
++
++			} while (ntfs_ie_end(icx->entry));
++		} else
++			break;
++
++	} while (ntfs_ie_end(icx->entry));
++
++	ret = 0;
++out:
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
++/*
++ * in order traversal of index btree
++ * returns: 0 on succes, -1 on error (with errno set)
++ * @entry will reference next entry
++ * errno == ENOENT indicates end of index
++ */
++int
++ntfs_index_iterate_next(ntfs_index_context *icx)
++{
++	int ret;
++
++	ret = -1;
++
++	ntfs_log_trace("Entering.\n");
++
++	if (!icx) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	if (!icx->ir && !icx->ib) {
++		ret = ntfs_index_load_root(icx);
++		if (ret)
++			goto out;
++	}
++
++	ret = __ntfs_index_iterate_next(icx);
++
++out:
++	if (!ret && icx->entry) {
++		if (icx->type == AT_FILE_NAME) {
++			icx->data = (u8 *)icx->entry +
++				offsetof(INDEX_ENTRY, key);
++			icx->data_len = le16_to_cpu(icx->entry->key_length);
++		} else {
++			icx->data = (u8 *)icx->entry +
++				le16_to_cpu(icx->entry->data_offset);
++			icx->data_len = le16_to_cpu(icx->entry->data_length);
++		}
++	}
++
++	if (!icx->entry) {
++		icx->data = NULL;
++		icx->data_len = 0;
++	}
++
++	icx->max_depth = icx->pindex;
++	ntfs_log_trace("Done (%d %d)\n", ret, errno);
++	return ret;
++}
++
+ static INDEX_BLOCK *ntfs_ib_alloc(VCN ib_vcn, u32 ib_size,
+ 				  INDEX_HEADER_FLAGS node_type)
+ {

@@ -1,0 +1,545 @@
+diff --git a/ntfsprogs/Makefile.am b/ntfsprogs/Makefile.am
+index e35d3c2..4fb7457 100644
+--- a/ntfsprogs/Makefile.am
++++ b/ntfsprogs/Makefile.am
+@@ -104,7 +104,8 @@ ntfsutil_SOURCES        = ntfsutil.c ntfsutil.h ntfsutil-lib.c ntfsutil-lib.h ut
+ 			  ntfsutil-cp.c \
+ 			  ntfsutil-rm.c \
+ 			  ntfsutil-mkdir.c \
+-			  ntfsutil-reparse.c
++			  ntfsutil-reparse.c \
++			  ntfsutil-dump.c
+ ntfsutil_LDADD          = $(AM_LIBS)
+ ntfsutil_LDFLAGS        = $(AM_LFLAGS)
+ 
+diff --git a/ntfsprogs/ntfsutil-dump.c b/ntfsprogs/ntfsutil-dump.c
+new file mode 100644
+index 0000000..2eaa765
+--- /dev/null
++++ b/ntfsprogs/ntfsutil-dump.c
+@@ -0,0 +1,493 @@
++/*
++ * ntfsutil-dump
++ *
++ * This utility will dump file system objects.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program (in the main directory of the Linux-NTFS
++ * distribution in the file COPYING); if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include "config.h"
++
++#ifdef HAVE_STDIO_H
++#include <stdio.h>
++#endif
++#ifdef HAVE_GETOPT_H
++#include <getopt.h>
++#endif
++#ifdef HAVE_STDLIB_H
++#include <stdlib.h>
++#endif
++#ifdef HAVE_STRING_H
++#include <string.h>
++#endif
++
++#include "types.h"
++#include "attrib.h"
++#include "dir.h"
++#include "utils.h"
++#include "index.h"
++#include "version.h"
++#include "ntfsutil.h"
++#include "ntfsutil-lib.h"
++
++struct ntfsutil_dump_ctx {
++	struct ntfsutil_dump_options      opts;
++	struct ntfsutil_target            tgt;
++};
++
++/**
++ * usage - Print a list of the parameters to the program
++ *
++ * Print a list of the parameters and options for the program.
++ *
++ * Return:  none
++ */
++static void usage(const char *app)
++{
++	ntfs_log_info("\nUsage: %s [options] image[:file]\n\n"
++		"    -m, --mrec                 Dump mrec info\n"
++		"    -d, --dirents              Dump directory entries\n"
++		"    -i, --inode                Inumber to dump\n"
++		"    -F, --force-mount          Mount dirty vol\n"
++		"    -V, --version              Version information\n"
++		"    -h, --help                 Print this help\n"
++		"    --log-{progress,quiet,verbose,trace,debug}\n\n", app);
++}
++
++/**
++ * parse_options - Read and validate the programs command line
++ *
++ * Read the command line, verify the syntax and parse the options.
++ * This function is very long, but quite simple.
++ *
++ * returns 0 if application should proceed, 1 otherwise, errno set on failure
++ */
++static int parse_options(struct ntfsutil_dump_options *opts,
++			 int argc, char **argv)
++{
++	static const char *sopt = "-mdi:FVh?";
++	static const struct option lopt[] = {
++		{ "mrec",	    no_argument,	NULL, 'm' },
++		{ "dirents",	    no_argument,	NULL, 'd' },
++		{ "inode",	    required_argument,	NULL, 'i' },
++		{ "force-mount",    no_argument,	NULL, 'F' },
++		{ "version",	    no_argument,	NULL, 'V' },
++		{ "help",	    no_argument,	NULL, 'h' },
++		{ NULL,		    0,			NULL, 0   }
++	};
++
++	int c, err, help, version;
++
++	err     = 0;
++	help    = 0;
++	version = 0;
++
++	optind  = 0;
++	opterr  = 0;
++
++	opts->inode = -1;
++
++	ntfs_log_clear_levels(NTFS_LOG_LEVEL_PROGRESS);
++
++	while ((c = getopt_long(argc, argv, sopt, lopt, NULL)) != -1) {
++		switch (c) {
++		case 1:	/* A non-option argument */
++			if (!opts->tgt)
++				opts->tgt = argv[optind - 1];
++			else {
++				ntfs_log_error("You must specify exactly one "
++					       "path.\n");
++				err = 1;
++			}
++			break;
++		case 'm':
++			opts->mrec = 1;
++			break;
++		case 'd':
++			opts->dirents = 1;
++			break;
++		case 'i':
++			if (opts->inode != -1) {
++				ntfs_log_error("specify only one ino\n");
++				err = 1;
++			} else if (!utils_parse_size(optarg,
++						     &opts->inode, FALSE)) {
++				ntfs_log_error("failed parsing %s\n", optarg);
++				err = 1;
++			}
++		case 'F':
++			opts->force_mount = 1;
++			break;
++		case 'V':
++			version = 1;
++			break;
++		case 'h':
++		case '?':
++			if (strncmp(argv[optind-1], "--log-", 6) == 0) {
++				if (!strcmp(argv[optind - 1], "--log-progress"))
++					ntfs_log_set_levels(NTFS_LOG_LEVEL_PROGRESS);
++				else if (!ntfs_log_parse_option(argv[optind-1]))
++					err = 1;
++				break;
++			}
++			help++;
++			break;
++		default:
++			ntfs_log_error("Unknown option '%s'.\n", argv[optind-1]);
++			err = 1;
++			break;
++		}
++	}
++
++	if (!help && !version) {
++		if (!opts->tgt) {
++			ntfs_log_error("You must specify a device.\n");
++			err = 1;
++		}
++		if (!opts->mrec && !opts->dirents) {
++			ntfs_log_error("You must specify an operation "
++				       "(--mrec or --dirents)\n");
++			err = 1;
++		}
++	}
++
++	if (help || version || err) {
++		ntfs_log_set_levels(NTFS_LOG_LEVEL_VERBOSE);
++		if (version)
++			ntfsutil_version();
++		if (help || err)
++			usage(argv[0]);
++		errno = (err ? EINVAL : 0);
++		err = 1;
++	}
++
++	return err;
++}
++
++static int
++ntfsutil_dump_dir(struct ntfsutil_dump_ctx *ctx, ntfs_inode *inode)
++{
++	int ret;
++	ntfs_index_context *ictx;
++
++	ret  = 1;
++	ictx = NULL;
++
++	if (!(inode->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
++		errno = ENOTDIR;
++		ntfs_log_perror("inode is not a directory");
++		goto out;
++	}
++
++	ictx = ntfs_index_ctx_get(inode, NTFS_INDEX_I30, 4);
++	if (!ictx) {
++		ntfs_log_perror("getting index ctx");
++		goto out;
++	}
++
++	while (!(ret = ntfs_index_iterate_next(ictx))) {
++		ntfs_dump_filename("", MREF_LE(ictx->entry->indexed_file),
++				   (FILE_NAME_ATTR *)&ictx->entry->key);
++		printf("\n");
++	}
++
++	if (errno != ENOENT)
++		ntfs_log_perror("iterating index");
++	else
++		ret = 0;
++
++out:
++	if (ictx)
++		ntfs_index_ctx_put(ictx);
++	return ret;
++}
++
++static const char *get_attribute_type_name(le32 type)
++{
++	switch (type) {
++	case AT_UNUSED:			return "$UNUSED";
++	case AT_STANDARD_INFORMATION:   return "$STANDARD_INFORMATION";
++	case AT_ATTRIBUTE_LIST:         return "$ATTRIBUTE_LIST";
++	case AT_FILE_NAME:              return "$FILE_NAME";
++	case AT_OBJECT_ID:              return "$OBJECT_ID";
++	case AT_SECURITY_DESCRIPTOR:    return "$SECURITY_DESCRIPTOR";
++	case AT_VOLUME_NAME:            return "$VOLUME_NAME";
++	case AT_VOLUME_INFORMATION:     return "$VOLUME_INFORMATION";
++	case AT_DATA:                   return "$DATA";
++	case AT_INDEX_ROOT:             return "$INDEX_ROOT";
++	case AT_INDEX_ALLOCATION:       return "$INDEX_ALLOCATION";
++	case AT_BITMAP:                 return "$BITMAP";
++	case AT_REPARSE_POINT:          return "$REPARSE_POINT";
++	case AT_EA_INFORMATION:         return "$EA_INFORMATION";
++	case AT_EA:                     return "$EA";
++	case AT_PROPERTY_SET:           return "$PROPERTY_SET";
++	case AT_LOGGED_UTILITY_STREAM:  return "$LOGGED_UTILITY_STREAM";
++	case AT_END:                    return "$END";
++	}
++
++	return "$UNKNOWN";
++}
++
++static void
++ntfsutil_init_inode(struct ntfsutil_dump_ctx *ctx,
++		    ntfs_inode *inode, MFT_RECORD *mrec)
++{
++	memset(inode, 0, sizeof(*inode));
++	inode->vol = ctx->tgt.vol;
++	inode->mrec = mrec;
++	inode->mft_no = MREF(ctx->opts.inode);
++	INIT_LIST_HEAD(&inode->attr_cache);
++}
++
++static int
++ntfsutil_dump_mrec_force(struct ntfsutil_dump_ctx *ctx)
++{
++	int ret;
++	MFT_RECORD *m;
++	ATTR_RECORD *a;
++	ntfs_inode dummy;
++	ntfs_attr_search_ctx *actx;
++
++	ret  = 1;
++	m    = NULL;
++	actx = NULL;
++
++	m = ntfs_malloc(ctx->tgt.vol->mft_record_size);
++	if (!m) {
++		ntfs_log_perror("allocating empty mrec");
++		goto out;
++	}
++
++	if (ntfs_mft_record_read(ctx->tgt.vol, MK_MREF(ctx->opts.inode, 0), m)) {
++		ntfs_log_perror("reading mft record");
++		goto out;
++	}
++
++	if (!ntfs_is_file_record(m->magic))
++		printf("record has bad magic\n");
++
++	a = (ATTR_RECORD *)((char *)m + le16_to_cpu(m->attrs_offset));
++	if (p2n(a) < p2n(m) || (char *)a > (char *)m + ctx->tgt.vol->mft_record_size)
++		printf("record has bad offset value\n");
++
++	if (!(m->flags & MFT_RECORD_IN_USE))
++		printf("record not in use\n");
++
++	printf("\nbase_mft_record\t\t\t (0x%llx)\n\n",
++	       le64_to_cpu(m->base_mft_record));
++
++	ntfsutil_init_inode(ctx, &dummy, m);
++
++	actx = ntfs_attr_get_search_ctx(&dummy, m);
++	if (!actx)
++		goto out;
++
++	while (!ntfs_attr_lookup(AT_UNUSED, NULL, 0, 0, 0, NULL, 0, actx)) {
++		if (actx->attr->type == AT_END || actx->attr->type == AT_UNUSED) {
++			printf("Weird: %s attribute type was found\n",
++			       get_attribute_type_name(actx->attr->type));
++			continue;
++		}
++
++		ntfs_dump_attribute_header(actx, ctx->tgt.vol);
++
++		switch (actx->attr->type) {
++		case AT_STANDARD_INFORMATION:
++			ntfs_dump_attr_standard_information(actx->attr);
++			break;
++		case AT_ATTRIBUTE_LIST:
++			ntfs_dump_attr_list(actx->attr, ctx->tgt.vol);
++			break;
++		case AT_FILE_NAME:
++			ntfs_dump_attr_file_name(ctx->opts.inode, actx->attr);
++			break;
++		case AT_OBJECT_ID:
++			ntfs_dump_attr_object_id(actx->attr, ctx->tgt.vol);
++			break;
++		case AT_SECURITY_DESCRIPTOR:
++			ntfs_dump_attr_security_descriptor(actx->attr, ctx->tgt.vol);
++			break;
++		case AT_VOLUME_NAME:
++			ntfs_dump_attr_volume_name(actx->attr);
++			break;
++		case AT_VOLUME_INFORMATION:
++			ntfs_dump_attr_volume_information(actx->attr);
++			break;
++		case AT_DATA:
++			printf("found AT_DATA\n");
++			//ntfs_dump_attr_data(actx->attr, ni);
++			break;
++		case AT_INDEX_ROOT:
++			printf("found AT_INDEX_ROOT\n");
++			//ntfs_dump_attr_index_root(actx->attr, ni);
++			break;
++		case AT_INDEX_ALLOCATION:
++			printf("found AT_INDEX_ALLOCATION\n");
++			//ntfs_dump_attr_index_allocation(actx->attr, ni);
++			break;
++		case AT_BITMAP:
++			ntfs_dump_attr_bitmap(actx->attr);
++			break;
++		case AT_REPARSE_POINT:
++			printf("found AT_REPARSE_POINT\n");
++			//ntfs_dump_attr_reparse_point(ni);
++			break;
++		case AT_EA_INFORMATION:
++			ntfs_dump_attr_ea_information(actx->attr);
++			break;
++		case AT_EA:
++			ntfs_dump_attr_ea(actx->attr, ctx->tgt.vol);
++			break;
++		case AT_PROPERTY_SET:
++			ntfs_dump_attr_property_set(actx->attr);
++			break;
++		case AT_LOGGED_UTILITY_STREAM:
++			printf("found AT_LOGGED_UTILITY_STREAM\n");
++			//ntfs_dump_attr_logged_utility_stream(actx->attr, ni);
++			break;
++		default:
++			ntfs_dump_attr_unknown(actx->attr);
++		}
++	}
++
++	/* if we exited the loop before we're done - notify the user */
++	if (errno != ENOENT) {
++		ntfs_log_perror("ntfsinfo error: stopped before finished "
++				"enumerating attributes");
++	}
++
++	ret = 0;
++
++out:
++	if (actx)
++		ntfs_attr_put_search_ctx(actx);
++	free(m);
++	return 0;
++}
++
++static int
++ntfsutil_dump_mrec(struct ntfsutil_dump_ctx *ctx, ntfs_inode *inode)
++{
++	ntfs_dump_file_attributes(inode);
++	return 0;
++}
++
++int
++_ntfsutil_dump(struct ntfsutil_dump_options *opts)
++{
++	int ret;
++	ntfs_inode *inode;
++	ntfs_mount_flags flags;
++	struct ntfsutil_dump_ctx ctx;
++
++	ret   = 1;
++	inode = NULL;
++
++	memset(&ctx, 0, sizeof(ctx));
++	memcpy(&ctx.opts, opts, sizeof(*opts));
++
++	if (ntfsutil_parse_target(ctx.opts.tgt, &ctx.tgt)) {
++		ntfs_log_error("failure parsing target %s\n", ctx.opts.tgt);
++		goto out;
++	}
++
++	if (!ctx.tgt.image) {
++		errno = EINVAL;
++		ntfs_log_perror("you must supply a target image");
++		goto out;
++	}
++
++	if ((ctx.opts.inode == -1 && !ctx.tgt.path) ||
++	    (ctx.opts.inode != -1 &&  ctx.tgt.path)) {
++		errno = EINVAL;
++		ntfs_log_perror("you must supply only one ino or target path");
++		goto out;
++	}
++
++	flags = NTFS_MNT_RDONLY;
++	if (ctx.opts.force_mount)
++		flags |= NTFS_MNT_FORCE;
++	ctx.tgt.vol = utils_mount_volume(ctx.tgt.image, flags);
++	if (!ctx.tgt.vol) {
++		ntfs_log_perror("mounting volume %s", ctx.tgt.image);
++		goto out;
++	}
++
++	if (ctx.opts.inode != -1) {
++		inode = ntfs_inode_open(ctx.tgt.vol, MREF(ctx.opts.inode));
++		if (!inode) {
++			if (ctx.opts.mrec) {
++				ntfs_log_info("couldn't open mref 0x%llx with "
++					      "standard library calls (%d)\n",
++					      ctx.opts.inode, errno);
++				ret = ntfsutil_dump_mrec_force(&ctx);
++			}
++			else
++				ntfs_log_perror("opening 0x%llx",
++						ctx.opts.inode);
++			goto out;
++		}
++	} else {
++		inode = ntfs_pathname_to_inode(ctx.tgt.vol, NULL, ctx.tgt.path);
++		if (!inode) {
++			ntfs_log_perror("opening %s", ctx.tgt.path);
++			goto out;
++		}
++	}
++
++	if (ctx.opts.dirents)
++		if (ntfsutil_dump_dir(&ctx, inode))
++			goto out;
++
++	if (ctx.opts.mrec)
++		if (ntfsutil_dump_mrec(&ctx, inode))
++			goto out;
++
++	ret = 0;
++
++out:
++	if (inode)
++		ntfs_inode_close(inode);
++	if (ctx.tgt.vol)
++		ntfs_umount(ctx.tgt.vol, FALSE);
++	free(ctx.tgt.image);
++	free(ctx.tgt.path);
++	return ret;
++}
++
++/**
++ * ntfsutil_dump() - parse command line options and return _ntfsutil_dump()
++ */
++int
++ntfsutil_dump(int argc, char *argv[])
++{
++	int ret;
++	struct ntfsutil_dump_options opts;
++
++	ret = 1;
++	memset(&opts, 0, sizeof(opts));
++
++	if (parse_options(&opts, argc, argv)) {
++		if (!errno)
++			ret = 0;
++		goto out;
++	}
++
++	ret = _ntfsutil_dump(&opts);
++
++out:
++	return ret;
++}
+diff --git a/ntfsprogs/ntfsutil.c b/ntfsprogs/ntfsutil.c
+index 42c681c..64f3721 100644
+--- a/ntfsprogs/ntfsutil.c
++++ b/ntfsprogs/ntfsutil.c
+@@ -52,6 +52,7 @@ static struct command commands[] = {
+ 	{ .name = "rm",        .func = ntfsutil_rm },
+ 	{ .name = "mkdir",     .func = ntfsutil_mkdir },
+ 	{ .name = "reparse",   .func = ntfsutil_reparse },
++	{ .name = "dump",      .func = ntfsutil_dump },
+ };
+ 
+ /**
+diff --git a/ntfsprogs/ntfsutil.h b/ntfsprogs/ntfsutil.h
+index 41084fa..fc57241 100644
+--- a/ntfsprogs/ntfsutil.h
++++ b/ntfsprogs/ntfsutil.h
+@@ -69,4 +69,15 @@ struct ntfsutil_reparse_options {
+ int ntfsutil_reparse(int, char **);
+ int _ntfsutil_reparse(struct ntfsutil_reparse_options *);
+ 
++struct ntfsutil_dump_options {
++	char         	            *tgt;         /* Device/File to work with */
++	s64                          inode;       /* Inode number to dump */
++	int                          mrec;        /* Dump mrec info */
++	int                          dirents;     /* Dump directory entries */
++	int		             force_mount; /* Override common sense */
++};
++
++int ntfsutil_dump(int, char **);
++int _ntfsutil_dump(struct ntfsutil_dump_options *);
++
+ #endif /* _NTFSUTIL_H_ */

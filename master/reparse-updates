@@ -1,0 +1,635 @@
+diff --git a/include/ntfs/reparse.h b/include/ntfs/reparse.h
+index 6aa45c2..27b3321 100644
+--- a/include/ntfs/reparse.h
++++ b/include/ntfs/reparse.h
+@@ -24,6 +24,59 @@
+ #ifndef REPARSE_H
+ #define REPARSE_H
+ 
++/*
++ * the definitions in layout.h are wrong, we use names defined in
++ * http://msdn.microsoft.com/en-us/library/aa365740(VS.85).aspx
++ */
++
++#define IO_REPARSE_TAG_DFS         const_cpu_to_le32(0x8000000A)
++#define IO_REPARSE_TAG_DFSR        const_cpu_to_le32(0x80000012)
++#define IO_REPARSE_TAG_HSM         const_cpu_to_le32(0xC0000004)
++#define IO_REPARSE_TAG_HSM2        const_cpu_to_le32(0x80000006)
++#define IO_REPARSE_TAG_MOUNT_POINT const_cpu_to_le32(0xA0000003)
++#define IO_REPARSE_TAG_SIS         const_cpu_to_le32(0x80000007)
++#define IO_REPARSE_TAG_SYMLINK     const_cpu_to_le32(0xA000000C)
++
++#define REPARSE_INDEX              "$Extend/$Reparse"
++
++struct MOUNT_POINT_REPARSE_DATA {    /* reparse data for junctions */
++	le16	subst_name_offset;
++	le16	subst_name_length;
++	le16	print_name_offset;
++	le16	print_name_length;
++	char	path_buffer[0];      /* above data assume this is char array */
++} __attribute__((__packed__));
++
++struct SYMLINK_REPARSE_DATA {        /* reparse data for symlinks */
++	le16	subst_name_offset;
++	le16	subst_name_length;
++	le16	print_name_offset;
++	le16	print_name_length;
++	le32	flags;		     /* 1 for full target, otherwise 0 */
++	char	path_buffer[0];      /* above data assume this is char array */
++} __attribute__((__packed__));
++
++static const ntfschar dir_junction_head[] = {
++	const_cpu_to_le16('\\'),
++	const_cpu_to_le16('?'),
++	const_cpu_to_le16('?'),
++	const_cpu_to_le16('\\')
++};
++
++static const ntfschar vol_junction_head[] = {
++	const_cpu_to_le16('\\'),
++	const_cpu_to_le16('?'),
++	const_cpu_to_le16('?'),
++	const_cpu_to_le16('\\'),
++	const_cpu_to_le16('V'),
++	const_cpu_to_le16('o'),
++	const_cpu_to_le16('l'),
++	const_cpu_to_le16('u'),
++	const_cpu_to_le16('m'),
++	const_cpu_to_le16('e'),
++	const_cpu_to_le16('{'),
++} ;
++
+ char *ntfs_make_symlink(const char *org_path,
+ 			ntfs_inode *ni, int *pattr_size);
+ BOOL ntfs_possible_symlink(ntfs_inode *ni);
+@@ -34,4 +87,15 @@ int ntfs_set_ntfs_reparse_data(const char *path, const char *value,
+ 			size_t size, int flags, ntfs_inode *ni);
+ int ntfs_remove_ntfs_reparse_data(const char *path, ntfs_inode *ni);
+ 
++int ntfs_set_reparse_point(const char *path, ntfs_inode *ni, REPARSE_POINT *point);
++
++int ntfs_extract_reparse_data(REPARSE_POINT *rp, char **data);
++int ntfs_parse_reparse_path(const char *data, char **vol, char **path);
++int ntfs_read_reparse_path(ntfs_inode *ni, le32 *type, char **vol, char **path);
++
++int ntfs_allocate_reparse_mount_point(const char *target,
++				      REPARSE_POINT **point, size_t *size);
++int ntfs_allocate_reparse_symlink(const char *target, REPARSE_POINT **point,
++				  size_t *size, le32 flags);
++
+ #endif /* REPARSE_H */
+diff --git a/libntfs/reparse.c b/libntfs/reparse.c
+index 4aaf6e3..c9bcf93 100644
+--- a/libntfs/reparse.c
++++ b/libntfs/reparse.c
+@@ -47,6 +47,8 @@
+ #include <sys/sysmacros.h>
+ #endif
+ 
++#include <regex.h>
++
+ #include "types.h"
+ #include "debug.h"
+ #include "attrib.h"
+@@ -59,62 +61,12 @@
+ #include "logging.h"
+ #include "reparse.h"
+ 
+-/* the definitions in layout.h are wrong, we use names defined in
+-  http://msdn.microsoft.com/en-us/library/aa365740(VS.85).aspx
+-*/
+-
+-#define IO_REPARSE_TAG_DFS         const_cpu_to_le32(0x8000000A)
+-#define IO_REPARSE_TAG_DFSR        const_cpu_to_le32(0x80000012)
+-#define IO_REPARSE_TAG_HSM         const_cpu_to_le32(0xC0000004)
+-#define IO_REPARSE_TAG_HSM2        const_cpu_to_le32(0x80000006)
+-#define IO_REPARSE_TAG_MOUNT_POINT const_cpu_to_le32(0xA0000003)
+-#define IO_REPARSE_TAG_SIS         const_cpu_to_le32(0x80000007)
+-#define IO_REPARSE_TAG_SYMLINK     const_cpu_to_le32(0xA000000C)
+-
+-struct MOUNT_POINT_REPARSE_DATA {      /* reparse data for junctions */
+-	le16	subst_name_offset;
+-	le16	subst_name_length;
+-	le16	print_name_offset;
+-	le16	print_name_length;
+-	char	path_buffer[0];      /* above data assume this is char array */
+-} ;
+-
+-struct SYMLINK_REPARSE_DATA {          /* reparse data for symlinks */
+-	le16	subst_name_offset;
+-	le16	subst_name_length;
+-	le16	print_name_offset;
+-	le16	print_name_length;
+-	le32	flags;		     /* 1 for full target, otherwise 0 */
+-	char	path_buffer[0];      /* above data assume this is char array */
+-} ;
+-
+ struct INODE_STACK {
+ 	struct INODE_STACK *previous;
+ 	struct INODE_STACK *next;
+ 	ntfs_inode *ni;
+ } ;
+ 
+-static const ntfschar dir_junction_head[] = {
+-	const_cpu_to_le16('\\'),
+-	const_cpu_to_le16('?'),
+-	const_cpu_to_le16('?'),
+-	const_cpu_to_le16('\\')
+-} ;
+-
+-static const ntfschar vol_junction_head[] = {
+-	const_cpu_to_le16('\\'),
+-	const_cpu_to_le16('?'),
+-	const_cpu_to_le16('?'),
+-	const_cpu_to_le16('\\'),
+-	const_cpu_to_le16('V'),
+-	const_cpu_to_le16('o'),
+-	const_cpu_to_le16('l'),
+-	const_cpu_to_le16('u'),
+-	const_cpu_to_le16('m'),
+-	const_cpu_to_le16('e'),
+-	const_cpu_to_le16('{'),
+-} ;
+-
+ static const char mappingdir[] = ".NTFS-3G/";
+ 
+ /*
+@@ -930,6 +882,32 @@ int ntfs_get_ntfs_reparse_data(const char *path  __attribute__((unused)),
+ }
+ 
+ /*
++ * sanity checks for adding reparse points:
++ *    - inode must be directory
++ *    - directory must be empty
++ *    - directory must not have extended attributes
++ *
++ * returns 0 if reparse point can be added or -1 otherwise
++ */
++static int
++ntfs_can_add_reparse_point(ntfs_inode *ni)
++{
++	int ret;
++
++	if (ntfs_check_empty_dir(ni)) {
++		ntfs_log_error("directory not empty");
++		return -1;
++	}
++
++	errno = 0;
++	ret = ntfs_attr_exist(ni, AT_EA, AT_UNNAMED, 0);
++	if (errno == ENOENT)
++		return 0;
++
++	return -1;
++}
++
++/*
+  *		Set the reparse data from an extended attribute
+  *
+  *	Warning : the new data is not checked
+@@ -947,6 +925,10 @@ int ntfs_set_ntfs_reparse_data(const char *path  __attribute__((unused)),
+ 
+ 	res = 0;
+ 	if (ni && (value || !size)) {
++
++		if (ntfs_can_add_reparse_point(ni))
++			return -1;
++
+ 		if (!ntfs_attr_exist(ni,AT_REPARSE_POINT,AT_UNNAMED,0)) {
+ 			if (!(flags & XATTR_REPLACE)) {
+ 			/*
+@@ -1050,3 +1032,434 @@ int ntfs_remove_ntfs_reparse_data(const char *path  __attribute__((unused)),
+ 	return (res ? -1 : 0);
+ }
+ 
++static int
++ntfs_update_reparse_index(ntfs_inode *ni, REPARSE_POINT *point)
++{
++	int ie_size, ret;
++	INDEX_ENTRY *ie;
++	ntfs_inode *index_ni;
++	REPARSE_INDEX_KEY key;
++	ntfs_index_context *icx;
++
++	ntfs_log_trace("Entering.\n");
++
++	ret      = -1;
++	ie       = NULL;
++	icx      = NULL;
++	index_ni = NULL;
++
++	if (!ni || !point) {
++		ntfs_log_error("invalid arguments\n");
++		errno = EINVAL;
++		goto out;
++	}
++
++	index_ni = ntfs_pathname_to_inode(ni->vol, NULL, REPARSE_INDEX);
++	if (!index_ni) {
++		ntfs_log_perror("opening reparse index");
++		goto out;
++	}
++
++	icx = ntfs_index_ctx_get(index_ni, NTFS_INDEX_R, 2);
++	if (!icx)
++		goto out;
++
++	key.reparse_tag = point->reparse_tag;
++	key.file_id     = MK_MREF(ni->mft_no,
++				  le16_to_cpu(ni->mrec->sequence_number));
++
++	/*
++	 * if an entry already exists for this reparse point,
++	 * simply update it (its size won't change) and we're done.
++	 */
++	if (!ntfs_index_lookup(&key, sizeof(key), icx)) {
++		memcpy(&icx->entry->key, &key, sizeof(key));
++		ntfs_index_entry_mark_dirty(icx);
++		ret = 0;
++		goto out;
++	} else if (errno != ENOENT) {
++		ntfs_log_perror("looking up reparse record");
++		goto out;
++	}
++
++	ntfs_index_ctx_reinit(icx);
++
++	/*
++	 * entry doesn't exist... allocate a new one and add it to index.
++	 */
++	ie_size = (sizeof(INDEX_ENTRY_HEADER) + sizeof(key) + 7) & ~7;
++	ie = ntfs_calloc(ie_size);
++	if (!ie) {
++		errno = ENOMEM;
++		goto out;
++	}
++
++	ie->data_offset = cpu_to_le16(sizeof(INDEX_ENTRY_HEADER) + sizeof(key));
++	ie->data_length = cpu_to_le16(0);
++	ie->length      = cpu_to_le16(ie_size);
++	ie->key_length  = cpu_to_le16(sizeof(key));
++	memcpy(&ie->key, &key, sizeof(key));
++
++	ret = ntfs_ie_add(icx, ie);
++
++out:
++	free(ie);
++	if (icx)
++		ntfs_index_ctx_put(icx);
++	if (index_ni)
++		ntfs_inode_close(index_ni);
++	return ret;
++}
++
++/*
++ * set a reparse point on a directory
++ *
++ * creates/sets reparse attribute data and updates reparse index
++ *
++ * returns 0 on success or -1 and errno
++ */
++int
++ntfs_set_reparse_point(const char *path __attribute__((unused)),
++		       ntfs_inode *ni, REPARSE_POINT *point)
++{
++	if (ntfs_set_ntfs_reparse_data(path, (char *)point,
++				       sizeof(*point) +
++				       le16_to_cpu(point->reparse_data_length),
++				       0, ni)) {
++		ntfs_log_perror("ERROR: setting reparse data");
++		return -1;
++	}
++
++	if (ntfs_update_reparse_index(ni, point)) {
++		ntfs_log_perror("ERROR: updating reparse index");
++		return -1;
++	}
++
++	return 0;
++}
++
++/**
++ * ntfs_allocate_reparse_mount_point() - allocate and initialize REPARSE_POINT
++ *
++ * @target: path to embed in reparse point
++ * @data: destination of reparse point
++ * @data_size: resulting size of reparse point
++ *
++ * allocates and initializes an ntfs reparse point of type mount point.
++ * @target is typically of the form '\??\Volume{guid}\'.
++ * @data should be free()'d after use.
++ *
++ * returns 0 on success or -1 on failure with errno set
++ */
++int
++ntfs_allocate_reparse_mount_point(const char *target,
++				  REPARSE_POINT **data, size_t *data_size)
++{
++	int un_target_len;
++	ntfschar *un_target;
++	REPARSE_POINT *header;
++	struct MOUNT_POINT_REPARSE_DATA *body;
++	unsigned int header_bytes, body_bytes, subst_bytes, print_bytes;
++
++	un_target = NULL;
++
++	un_target_len = ntfs_mbstoucs(target, &un_target, 0);
++	if (un_target_len == -1) {
++		ntfs_log_perror("ERROR: couldn't convert target name");
++		return -1;
++	}
++
++	subst_bytes = un_target_len * sizeof(ntfschar);
++	print_bytes = un_target_len * sizeof(ntfschar);
++	header_bytes = sizeof(REPARSE_POINT);
++	body_bytes = (sizeof(struct MOUNT_POINT_REPARSE_DATA) +
++		      subst_bytes + 2 + print_bytes + 2);
++
++	header = ntfs_calloc(header_bytes + body_bytes);
++	if (!header) {
++		ntfs_log_perror("ERROR: couldn't allocate target string");
++		free(un_target);
++		return -1;
++	}
++
++	header->reparse_tag = IO_REPARSE_TAG_MOUNT_POINT;
++	header->reparse_data_length = cpu_to_le16(body_bytes);
++	body = (struct MOUNT_POINT_REPARSE_DATA *)header->reparse_data;
++	body->subst_name_offset = cpu_to_le16(0);
++	body->subst_name_length = cpu_to_le16(subst_bytes);
++	body->print_name_offset = cpu_to_le16(subst_bytes + 2);
++	body->print_name_length = cpu_to_le16(print_bytes);
++
++	memcpy(body->path_buffer, un_target, subst_bytes);
++	memcpy(body->path_buffer + le16_to_cpu(body->print_name_offset),
++	       un_target, print_bytes);
++
++	free(un_target);
++
++	*data      = header;
++	*data_size = header_bytes + body_bytes;
++
++	return 0;
++}
++
++/**
++ * ntfs_allocate_reparse_symlink() - allocate and initialize REPARSE_POINT
++ *
++ * @target: path to embed in reparse point
++ * @data: destination of reparse point
++ * @data_size: resulting size of reparse point
++ * @flags: absolute or relative path
++ *
++ * allocates and initializes an ntfs reparse point of type symlink.
++ * @target is typically of the form '\??\C:\path'.
++ * @data should be free()'d after use.
++ *
++ * returns 0 on success or -1 on failure with errno set
++ */
++int
++ntfs_allocate_reparse_symlink(const char *target, REPARSE_POINT **data,
++			      size_t *data_size, le32 flags)
++{
++	int un_target_len;
++	ntfschar *un_target;
++	REPARSE_POINT *header;
++	struct SYMLINK_REPARSE_DATA *body;
++	unsigned int header_bytes, body_bytes, subst_bytes, print_bytes;
++
++	un_target = NULL;
++
++	un_target_len = ntfs_mbstoucs(target, &un_target, 0);
++	if (un_target_len == -1) {
++		ntfs_log_perror("ERROR: couldn't convert target name");
++		return -1;
++	}
++
++	subst_bytes = un_target_len * sizeof(ntfschar);
++	print_bytes = un_target_len * sizeof(ntfschar);
++	header_bytes = sizeof(REPARSE_POINT);
++	body_bytes = (sizeof(struct SYMLINK_REPARSE_DATA) +
++		      subst_bytes + 2 + print_bytes + 2);
++
++	header = ntfs_calloc(header_bytes + body_bytes);
++	if (!header) {
++		ntfs_log_perror("ERROR: couldn't allocate target string");
++		free(un_target);
++		return -1;
++	}
++
++	header->reparse_tag = IO_REPARSE_TAG_SYMLINK;
++	header->reparse_data_length = cpu_to_le16(body_bytes);
++	body = (struct SYMLINK_REPARSE_DATA *)header->reparse_data;
++	body->flags             = flags;
++	body->subst_name_offset = cpu_to_le16(0);
++	body->subst_name_length = cpu_to_le16(subst_bytes);
++	body->print_name_offset = cpu_to_le16(subst_bytes + 2);
++	body->print_name_length = cpu_to_le16(print_bytes);
++
++	memcpy(body->path_buffer, un_target, subst_bytes);
++	memcpy(body->path_buffer + le16_to_cpu(body->print_name_offset),
++	       un_target, print_bytes);
++
++	free(un_target);
++
++	*data      = header;
++	*data_size = header_bytes + body_bytes;
++
++	return 0;
++}
++
++int
++ntfs_extract_reparse_data(REPARSE_POINT *rp, char **data)
++{
++	int ret;
++	ntfschar *md, *sp;
++	le16 sno, snl, data_length;
++
++	ret   = 1;
++	*data = NULL;
++
++	switch (rp->reparse_tag) {
++	case IO_REPARSE_TAG_MOUNT_POINT: {
++		struct MOUNT_POINT_REPARSE_DATA *mp;
++
++		mp  = (struct MOUNT_POINT_REPARSE_DATA *)rp->reparse_data;
++		md  = (ntfschar *)mp->path_buffer;
++
++		sno = le16_to_cpu(mp->subst_name_offset);
++		snl = le16_to_cpu(mp->subst_name_length);
++
++		break;
++	}
++
++	case IO_REPARSE_TAG_SYMLINK: {
++		struct SYMLINK_REPARSE_DATA *sl;
++
++		sl  = (struct SYMLINK_REPARSE_DATA *)rp->reparse_data;
++		md  = (ntfschar *)sl->path_buffer;
++
++		sno = le16_to_cpu(sl->subst_name_offset);
++		snl = le16_to_cpu(sl->subst_name_length);
++
++		break;
++	}
++
++	default:
++		errno = EINVAL;
++		ntfs_log_perror("invalid reparse type 0x%x",
++				rp->reparse_tag);
++		goto out;
++	}
++
++	data_length = le16_to_cpu(rp->reparse_data_length);
++
++	if (sno < 0 || snl <= 0 || sno + snl >= data_length) {
++		errno = EIO;
++		ntfs_log_perror("malformed reparse point");
++		goto out;
++	}
++
++	sp = md + (sno / sizeof(ntfschar));
++	if (ntfs_ucstombs(sp, snl / sizeof(ntfschar), data, 0) == -1) {
++		ntfs_log_perror("converting subsitute name");
++		goto out;
++	}
++
++	ret = 0;
++out:
++	return ret;
++}
++
++int
++ntfs_parse_reparse_path(const char *rp_data, char **vol, char **path)
++{
++#define HEX       "[A-Za-z0-9]"
++#define UUID      HEX"{8}-"HEX"{4}-"HEX"{4}-"HEX"{4}-"HEX"{12}"
++#define PATH_PREF "\\\\??\\\\"
++#define GUID_PREF PATH_PREF"Volume\\{("UUID")\\}"
++#define VOL_PREF  PATH_PREF"([A-Z]):"
++#define MATCHES   3
++
++	regex_t reg;
++	regmatch_t m[MATCHES];
++	int ret, rc, vsize, psize;
++	const char *gpattern = GUID_PREF"(.*)$";
++	const char *vpattern = VOL_PREF"(.*)$";
++
++	ret    = 1;
++	*vol   = NULL;
++	*path  = NULL;
++
++	if (regcomp(&reg, gpattern, REG_EXTENDED | REG_NEWLINE))
++		goto out;
++
++	rc = regexec(&reg, rp_data, MATCHES, m, 0);
++	regfree(&reg);
++
++	if (rc) {
++		if (regcomp(&reg, vpattern, REG_EXTENDED | REG_NEWLINE))
++			goto out;
++
++		rc = regexec(&reg, rp_data, MATCHES, m, 0);
++		regfree(&reg);
++		if (rc)
++			goto out;
++	}
++
++	if (m[1].rm_so == -1 || m[2].rm_so == -1)
++		goto out;
++
++	vsize = m[1].rm_eo - m[1].rm_so;
++	psize = m[2].rm_eo - m[2].rm_so;
++
++	*vol  = ntfs_malloc(vsize + 1);
++	*path = ntfs_malloc(psize + 1);
++
++	if (!*vol || !*path) {
++		free(*vol);
++		free(*path);
++		*vol  = NULL;
++		*path = NULL;
++		errno = ENOMEM;
++		goto out;
++	}
++
++	(*vol)[vsize]  = '\0';
++	(*path)[psize] = '\0';
++
++	memcpy(*vol, rp_data + m[1].rm_so, vsize);
++	memcpy(*path, rp_data + m[2].rm_so, psize);
++
++	ret = 0;
++
++#undef HEX
++#undef UUID
++#undef PATH_PREF
++#undef GUID_PREF
++#undef VOL_PREF
++#undef MATCHES
++
++out:
++	if (ret && errno != ENOMEM) {
++		errno = EINVAL;
++		ntfs_log_perror("malformed reparse data %s", rp_data);
++	}
++
++	return ret;
++}
++
++int
++ntfs_read_reparse_path(ntfs_inode *isrc, le32 *type, char **vol, char **path)
++{
++	int ret;
++	int size;
++	char *rp_path, *p;
++	REPARSE_POINT *rp;
++
++	ret     = 1;
++	rp      = NULL;
++	rp_path = NULL;
++
++	size = ntfs_get_ntfs_reparse_data(NULL, NULL, 0, isrc);
++	if (size < 0) {
++		errno = -size;
++		ntfs_log_perror("reading reparse data size");
++		goto out;
++	}
++
++	rp = ntfs_malloc(size);
++	if (!rp)
++		goto out;
++
++	size = ntfs_get_ntfs_reparse_data(NULL, (char *)rp, size, isrc);
++	if (size < 0) {
++		errno = -size;
++		ntfs_log_perror("reading reparse data");
++		goto out;
++	}
++
++	if (rp->reparse_tag != IO_REPARSE_TAG_MOUNT_POINT &&
++	    rp->reparse_tag != IO_REPARSE_TAG_SYMLINK) {
++		errno = ENOSYS;
++		ntfs_log_perror("reparse type 0x%x not supported",
++				rp->reparse_tag);
++		goto out;
++	}
++
++	if (ntfs_extract_reparse_data(rp, &rp_path))
++		goto out;
++
++	if (ntfs_parse_reparse_path(rp_path, vol, path))
++		goto out;
++
++	for (p = *path; *p; p++)
++		if (*p == '\\')
++			*p = '/';
++
++	*type = rp->reparse_tag;
++	ret   = 0;
++
++out:
++	free(rp);
++	free(rp_path);
++	return ret;
++}

@@ -1,0 +1,711 @@
+diff --git a/include/ntfs/bitmap.h b/include/ntfs/bitmap.h
+index f6d16f1..405eec0 100644
+--- a/include/ntfs/bitmap.h
++++ b/include/ntfs/bitmap.h
+@@ -131,4 +131,29 @@ static __inline__ int ntfs_bitmap_clear_bit(ntfs_attr *na, s64 bit)
+ 	return ntfs_bitmap_clear_run(na, bit, 1);
+ }
+ 
++/*
++ * taken from ntfs-3g
++ */
++/*
++ * rol32 - rotate a 32-bit value left
++ *
++ * @word: value to rotate
++ * @shift: bits to roll
++ */
++static __inline__ u32 ntfs_rol32(u32 word, unsigned int shift)
++{
++	return (word << shift) | (word >> (32 - shift));
++}
++
++/*
++ * ror32 - rotate a 32-bit value right
++ *
++ * @word: value to rotate
++ * @shift: bits to roll
++ */
++static __inline__ u32 ntfs_ror32(u32 word, unsigned int shift)
++{
++	return (word >> shift) | (word << (32 - shift));
++}
++
+ #endif /* defined _NTFS_BITMAP_H */
+diff --git a/include/ntfs/security.h b/include/ntfs/security.h
+index a61aabd..2abdce8 100644
+--- a/include/ntfs/security.h
++++ b/include/ntfs/security.h
+@@ -25,9 +25,12 @@
+ 
+ #include "types.h"
+ #include "layout.h"
++#include "volume.h"
+ 
+ extern const GUID *const zero_guid;
+ 
++extern ntfschar NTFS_ATTR_SDS[5];
++
+ extern BOOL ntfs_guid_is_zero(const GUID *guid);
+ extern char *ntfs_guid_to_mbs(const GUID *guid, char *guid_str);
+ 
+@@ -52,4 +55,11 @@ extern char *ntfs_sid_to_mbs(const SID *sid, char *sid_str,
+ 		size_t sid_str_size);
+ extern void ntfs_generate_guid(GUID *guid);
+ 
++extern SDS_ENTRY * ntfs_sd_find_by_id(ntfs_volume *vol, u32 id);
++extern SDS_ENTRY * ntfs_sd_find_by_hash(ntfs_volume *vol,
++					SECURITY_DESCRIPTOR_ATTR *sid,
++					u32 sid_len);
++extern SDS_ENTRY * ntfs_sd_add(ntfs_volume *vol,
++			       SECURITY_DESCRIPTOR_ATTR *sid, u32 sid_len);
++
+ #endif /* defined _NTFS_SECURITY_H */
+diff --git a/libntfs/collate.c b/libntfs/collate.c
+index 620a78a..b18c2cc 100644
+--- a/libntfs/collate.c
++++ b/libntfs/collate.c
+@@ -154,6 +154,63 @@ done:
+ 	return rc;
+ }
+ 
++/*
++ * taken from ntfs-3g
++ */
++/**
++ * ntfs_collate_ntofs_security_hash - Which of two security descriptors
++ *                    should be listed first
++ * @vol: unused
++ * @data1:
++ * @data1_len:
++ * @data2:
++ * @data2_len:
++ *
++ * JPA compare two security hash keys made of two unsigned le32
++ *
++ * Returns: -1, 0 or 1 depending of how the keys compare
++ */
++static int ntfs_collate_ntofs_security_hash(ntfs_volume *vol __attribute__((unused)),
++                const void *data1, const int data1_len,
++                const void *data2, const int data2_len)
++{
++	int rc;
++	u32 d1, d2;
++	const u32 *p1, *p2;
++
++	ntfs_log_trace("Entering.\n");
++	if (data1_len != data2_len || data1_len != 8) {
++		ntfs_log_error("data1_len or/and data2_len not equal to 8.\n");
++		return NTFS_COLLATION_ERROR;
++	}
++	p1 = (const u32*)data1;
++	p2 = (const u32*)data2;
++	d1 = le32_to_cpup(p1);
++	d2 = le32_to_cpup(p2);
++	if (d1 < d2)
++		rc = -1;
++	else {
++		if (d1 > d2)
++			rc = 1;
++		else {
++			p1++;
++			p2++;
++			d1 = le32_to_cpup(p1);
++			d2 = le32_to_cpup(p2);
++			if (d1 < d2)
++				rc = -1;
++			else {
++				if (d1 > d2)
++					rc = 1;
++				else
++					rc = 0;
++			}
++		}
++	}
++	ntfs_log_trace("Done, returning %i.\n", rc);
++	return rc;
++}
++
+ /**
+  * ntfs_collate_file_name - Which of two filenames should be listed first
+  * @vol:
+@@ -195,7 +252,7 @@ static ntfs_collate_func_t ntfs_do_collate0x0[3] = {
+ static ntfs_collate_func_t ntfs_do_collate0x1[4] = {
+ 	ntfs_collate_ntofs_ulong,
+ 	NULL/*ntfs_collate_ntofs_sid*/,
+-	NULL/*ntfs_collate_ntofs_security_hash*/,
++	ntfs_collate_ntofs_security_hash,
+ 	ntfs_collate_ntofs_ulongs,
+ };
+ 
+@@ -213,7 +270,8 @@ static ntfs_collate_func_t ntfs_do_collate0x1[4] = {
+ BOOL ntfs_is_collation_rule_supported(COLLATION_RULES cr)
+ {
+ 	return (cr == COLLATION_BINARY || cr == COLLATION_NTOFS_ULONG ||
+-		cr == COLLATION_FILE_NAME || cr == COLLATION_NTOFS_ULONGS);
++		cr == COLLATION_FILE_NAME || cr == COLLATION_NTOFS_ULONGS ||
++		cr == COLLATION_NTOFS_SECURITY_HASH);
+ 	/*
+ 	 * FIXME:  At the moment we only support COLLATION_BINARY,
+ 	 * COLLATION_NTOFS_ULONG and COLLATION_FILE_NAME.
+diff --git a/libntfs/security.c b/libntfs/security.c
+index 55f123f..7065186 100644
+--- a/libntfs/security.c
++++ b/libntfs/security.c
+@@ -39,6 +39,9 @@
+ #include "types.h"
+ #include "layout.h"
+ #include "security.h"
++#include "bitmap.h"
++#include "index.h"
++#include "dir.h"
+ 
+ /*
+  * The zero GUID.
+@@ -269,3 +272,546 @@ void ntfs_generate_guid(GUID *guid)
+ 	}
+ }
+ 
++/*
++ * hash taken from ntfs-3g
++ */
++/**
++ * ntfs_security_hash - calculate the hash of a security descriptor
++ * @sd:         self-relative security descriptor whose hash to calculate
++ * @length:     size in bytes of the security descritor @sd
++ *
++ * Calculate the hash of the self-relative security descriptor @sd of length
++ * @length bytes.
++ *
++ * This hash is used in the $Secure system file as the primary key for the $SDH
++ * index and is also stored in the header of each security descriptor in the
++ * $SDS data stream as well as in the index data of both the $SII and $SDH
++ * indexes.  In all three cases it forms part of the SDS_ENTRY_HEADER
++ * structure.
++ *
++ * Return the calculated security hash in little endian.
++ */
++static le32 ntfs_security_hash(const SECURITY_DESCRIPTOR_RELATIVE *sd,
++			       const u32 len)
++{
++	const le32 *pos = (const le32 *)sd;
++	const le32 *end = pos + (len >> 2);
++	u32 hash = 0;
++
++	while (pos < end) {
++		hash = le32_to_cpup(pos) + ntfs_rol32(hash, 3);
++		pos++;
++	}
++	return cpu_to_le32(hash);
++}
++
++ntfschar NTFS_ATTR_SDS[5] = { const_cpu_to_le16('$'),
++			      const_cpu_to_le16('S'),
++			      const_cpu_to_le16('D'),
++			      const_cpu_to_le16('S'),
++			      const_cpu_to_le16('\0') };
++
++/**
++ * ntfs_sd_read() - read an sds entry from a volume
++ *
++ * @vol: volume to read from
++ * @offset: offset into $Secure
++ * @length: size of entry
++ *
++ * returns reference to entry or NULL on failure w/ errno set
++ * entry should be free()'d
++ */
++static SDS_ENTRY *
++ntfs_sd_read(ntfs_volume *vol, u64 offset, u32 length)
++{
++	SDS_ENTRY *sd;
++	ntfs_attr *nattr;
++	ntfs_inode *inode;
++
++	sd    = NULL;
++	nattr = NULL;
++	inode = NULL;
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	nattr = ntfs_attr_open(inode, AT_DATA, NTFS_ATTR_SDS, 4);
++	if (!nattr)
++		goto out;
++
++	sd = ntfs_malloc(length);
++	if (!sd)
++		goto out;
++
++	if (ntfs_attr_pread(nattr, offset, length, sd) != (s64)length) {
++		free(sd);
++		sd = NULL;
++		goto out;
++	}
++
++out:
++	if (nattr)
++		ntfs_attr_close(nattr);
++	if (inode)
++		ntfs_inode_close(inode);
++	return sd;
++}
++
++/**
++ * ntfs_sd_write() - write an sds entry
++ *
++ * @vol: volume to write to
++ * @sd: entry to write
++ *
++ * returns 0 on success or 1 on failure w/ errno set
++ */
++static int
++ntfs_sd_write(ntfs_volume *vol, SDS_ENTRY *sd)
++{
++	u32 length;
++	u64 offset;
++	int ret, err;
++	ntfs_attr *nattr;
++	ntfs_inode *inode;
++
++	ret   = 1;
++	nattr = NULL;
++	inode = NULL;
++
++	offset = le64_to_cpu(sd->offset);
++	length = le32_to_cpu(sd->length);
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	nattr = ntfs_attr_open(inode, AT_DATA, NTFS_ATTR_SDS, 4);
++	if (!nattr)
++		goto out;
++
++	if (ntfs_attr_pwrite(nattr, offset, length, sd) != length)
++		goto out;
++
++	/*
++	 * see comment in layout.h concerning SDS_ENTRY
++	 */
++	if (ntfs_attr_pwrite(nattr, offset + 0x40000, length, sd) != length)
++		goto out;
++
++	ret = 0;
++
++out:
++	err = errno;
++	if (nattr)
++		ntfs_attr_close(nattr);
++	if (inode)
++		ntfs_inode_close(inode);
++	errno = err;
++	return ret;
++}
++
++/**
++ * ntfs_sd_find_by_id() - read an sds entry given its id
++ *
++ * @vol: volume to read from
++ * @security_id: id of entry to read
++ *
++ * returns reference to entry or NULL on failure w/ errno set
++ * entry should be free()'d
++ */
++SDS_ENTRY *
++ntfs_sd_find_by_id(ntfs_volume *vol, u32 security_id)
++{
++	SDS_ENTRY *sd;
++	ntfs_inode *inode;
++	SII_INDEX_KEY key;
++	SII_INDEX_DATA *sii;
++	ntfs_index_context *icx;
++
++	sd    = NULL;
++	icx   = NULL;
++	inode = NULL;
++
++	ntfs_log_trace("Entering for 0x%x\n", security_id);
++
++	if (!vol) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	icx = ntfs_index_ctx_get(inode, NTFS_INDEX_SII, 4);
++	if (!icx)
++		goto out;
++
++	key.security_id = cpu_to_le32(security_id);
++	if (ntfs_index_lookup(&key, sizeof(key), icx))
++		goto out;
++
++	sii = (SII_INDEX_DATA *)icx->data;
++	sd = ntfs_sd_read(vol,
++			  le64_to_cpu(sii->offset),
++			  le32_to_cpu(sii->length));
++
++out:
++	if (icx)
++		ntfs_index_ctx_put(icx);
++	if (inode)
++		ntfs_inode_close(inode);
++	return sd;
++}
++
++/**
++ * ntfs_sd_add_id() - add sds id to $Secure:$SII
++ *
++ * @vol: volume to which to add index key
++ * @sd: entry to add index key for
++ *
++ * returns 0 on success or 1 on failure w/ errno set
++ */
++static int
++ntfs_sd_add_id(ntfs_volume *vol, SDS_ENTRY *sd)
++{
++	INDEX_ENTRY *ie;
++	ntfs_inode *inode;
++	SII_INDEX_KEY sii_key;
++	SII_INDEX_DATA sii_data;
++	ntfs_index_context *icx;
++	int ret, ie_size, ie_data_off, ie_data_size;
++
++	ret   = 1;
++	ie    = NULL;
++	icx   = NULL;
++	inode = NULL;
++
++	ntfs_log_trace("Entering\n");
++
++	sii_key.security_id  = sd->security_id;
++
++	sii_data.hash        = sd->hash;
++	sii_data.security_id = sd->security_id;
++	sii_data.offset      = sd->offset;
++	sii_data.length      = sd->length;
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	icx = ntfs_index_ctx_get(inode, NTFS_INDEX_SII, 4);
++	if (!icx)
++		goto out;
++
++	ie_data_off     = sizeof(INDEX_ENTRY_HEADER) + sizeof(SII_INDEX_KEY);
++	ie_data_size    = sizeof(SII_INDEX_DATA);
++	ie_size         = (ie_data_off + ie_data_size + 7) & ~7;
++
++	ie = ntfs_calloc(ie_size);
++	if (!ie)
++		goto out;
++
++	ie->key_length  = cpu_to_le16(sizeof(SII_INDEX_KEY));
++	ie->length      = cpu_to_le16(ie_size);
++	ie->data_offset = cpu_to_le16(ie_data_off);
++	ie->data_length = cpu_to_le16(ie_data_size);
++
++	memcpy(&ie->key.sii, &sii_key, sizeof(sii_key));
++	memcpy((u8 *)ie + ie_data_off, &sii_data, sizeof(sii_data));
++
++	if (ntfs_ie_add(icx, ie))
++		goto out;
++
++	ret = 0;
++
++out:
++	free(ie);
++	if (icx)
++		ntfs_index_ctx_put(icx);
++	if (inode)
++		ntfs_inode_close(inode);
++	ntfs_log_trace("Done (%d %d).\n", ret, errno);
++	return ret;
++}
++
++/**
++ * ntfs_sd_find_by_hash() - search for an sds entry in $Secure:$SDH
++ *
++ * @vol: volume to read from
++ * @sid: descriptor to search for
++ * @sid_length: length of descriptor
++ *
++ * returns reference to entry or NULL on failure w/ errno set
++ * entry should be free()'d
++ */
++SDS_ENTRY *
++ntfs_sd_find_by_hash(ntfs_volume *vol,
++		     SECURITY_DESCRIPTOR_ATTR *sid, u32 sid_length)
++{
++	le32 hash;
++	SDS_ENTRY *sd;
++	ntfs_inode *inode;
++	ntfs_index_context *icx;
++
++	sd    = NULL;
++	icx   = NULL;
++	inode = NULL;
++
++	ntfs_log_trace("Entering\n");
++
++	if (!vol) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	hash = ntfs_security_hash(sid, sid_length);
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	icx = ntfs_index_ctx_get(inode, NTFS_INDEX_SDH, 4);
++	if (!icx)
++		goto out;
++
++	/*
++	 * TODO: improve this search
++	 */
++	while (!ntfs_index_iterate_next(icx)) {
++		SDH_INDEX_KEY *key = &icx->entry->key.sdh;
++
++		if (key->hash == hash) {
++			SDH_INDEX_DATA *sdh = icx->data;
++
++			sd = ntfs_sd_read(vol,
++					  le64_to_cpu(sdh->offset),
++					  le32_to_cpu(sdh->length));
++			if (!sd)
++				goto out;
++
++			if (sid_length == le32_to_cpu(sd->length) -
++			    sizeof(SECURITY_DESCRIPTOR_HEADER) &&
++			    !memcmp(&sd->sid, sid, sid_length))
++				goto out;
++
++			free(sd);
++			sd = NULL;
++		}
++	}
++
++out:
++	if (icx)
++		ntfs_index_ctx_put(icx);
++	if (inode)
++		ntfs_inode_close(inode);
++	return sd;
++}
++
++/**
++ * ntfs_sd_add_hash() - add sds hash to $Secure:$SDH
++ *
++ * @vol: volume to which to add index key
++ * @sd: entry to add index key for
++ *
++ * returns 0 on success or 1 on failure w/ errno set
++ */
++static int
++ntfs_sd_add_hash(ntfs_volume *vol, SDS_ENTRY *sd)
++{
++	INDEX_ENTRY *ie;
++	ntfs_inode *inode;
++	SDH_INDEX_KEY sdh_key;
++	SDH_INDEX_DATA sdh_data;
++	ntfs_index_context *icx;
++	int ret, ie_size, ie_data_off, ie_data_size;
++
++	ret   = 1;
++	ie    = NULL;
++	icx   = NULL;
++	inode = NULL;
++
++	ntfs_log_trace("Entering\n");
++
++	sdh_key.hash         = sd->hash;
++	sdh_key.security_id  = sd->security_id;
++
++	sdh_data.hash        = sd->hash;
++	sdh_data.security_id = sd->security_id;
++	sdh_data.offset      = sd->offset;
++	sdh_data.length      = sd->length;
++	sdh_data.reserved_II = 0;
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	icx = ntfs_index_ctx_get(inode, NTFS_INDEX_SDH, 4);
++	if (!icx)
++		goto out;
++
++	ie_data_off     = sizeof(INDEX_ENTRY_HEADER) + sizeof(SDH_INDEX_KEY);
++	ie_data_size    = (sizeof(SDH_INDEX_DATA) -
++			   sizeof(sdh_data.reserved_II));
++	ie_size         = (ie_data_off + ie_data_size + 7) & ~7;
++
++	ie = ntfs_calloc(ie_size);
++	if (!ie)
++		goto out;
++
++	ie->key_length  = cpu_to_le16(sizeof(SDH_INDEX_KEY));
++	ie->length      = cpu_to_le16(ie_size);
++	ie->data_offset = cpu_to_le16(ie_data_off);
++	ie->data_length = cpu_to_le16(ie_data_size);
++
++	memcpy(&ie->key.sdh, &sdh_key, sizeof(sdh_key));
++	memcpy((u8 *)ie + ie_data_off, &sdh_data, sizeof(sdh_data));
++
++	if (ntfs_ie_add(icx, ie))
++		goto out;
++
++	ret = 0;
++
++out:
++	free(ie);
++	if (icx)
++		ntfs_index_ctx_put(icx);
++	if (inode)
++		ntfs_inode_close(inode);
++	ntfs_log_trace("Done (%d %d).\n", ret, errno);
++	return ret;
++}
++
++/**
++ * ntfs_sd_next_entry() - determine where next sds entry should go
++ *
++ * @vol: volume to add entry to
++ * @id: lowest unused security_id on volume
++ * @offset: byte offset in $Secure:$SDS at which next entry should be written
++ *
++ * returns 0 on success or 1 on failure w/ errno set
++ */
++static int
++ntfs_sd_next_entry(ntfs_volume *vol, u32 *id, s64 *offset)
++{
++	u32 max_id;
++	u64 max_off;
++	int ret, rc;
++	ntfs_inode *inode;
++	ntfs_index_context *icx;
++
++	ret      = 1;
++	max_id   = 0;
++	max_off  = 0;
++	icx      = NULL;
++	inode    = NULL;
++
++	inode = ntfs_inode_open(vol, MREF(FILE_Secure));
++	if (!inode)
++		goto out;
++
++	icx = ntfs_index_ctx_get(inode, NTFS_INDEX_SII, 4);
++	if (!icx)
++		goto out;
++
++	while (!(rc = ntfs_index_iterate_next(icx))) {
++		SII_INDEX_DATA *sii = icx->data;
++		u32 cur_id = le32_to_cpu(sii->security_id);
++		u64 cur_off = le64_to_cpu(sii->offset) +
++			le32_to_cpu(sii->length);
++
++		max_id  = max(cur_id, max_id);
++		max_off = max(cur_off, max_off);
++	}
++
++	if (rc && errno != ENOENT)
++		goto out;
++	errno = 0;
++
++	*id     = max_id + 1;
++	*offset = (max_off + 0xf) & ~0xf;
++
++	if (*id < max_id || *offset < max_off) {
++		errno = ERANGE;
++		goto out;
++	}
++
++	ntfs_log_trace("id 0x%x off 0x%llx\n", *id, *offset);
++	ret = 0;
++
++out:
++	if (icx)
++		ntfs_index_ctx_put(icx);
++	if (inode)
++		ntfs_inode_close(inode);
++	return ret;
++}
++
++/**
++ * ntfs_sd_add() - add new sds entry to volume
++ *
++ * @vol: volume to add entry to
++ * @sid: relative security descriptor
++ * @sid_length: length of @sid
++ *
++ * returns reference to sds entry or NULL on failure w/ errno set
++ * entry should be free()'d
++ *
++ */
++SDS_ENTRY *
++ntfs_sd_add(ntfs_volume *vol,
++	    SECURITY_DESCRIPTOR_ATTR *sid, u32 sid_length)
++{
++	s64 offset;
++	SDS_ENTRY *sd;
++	u32 id, sd_length;
++
++	sd     = NULL;
++	id     = -1;
++	offset = -1;
++
++	ntfs_log_trace("Entering\n");
++
++	if (!vol) {
++		errno = EINVAL;
++		goto out;
++	}
++
++	sd = ntfs_sd_find_by_hash(vol, sid, sid_length);
++	if (sd) {
++		ntfs_log_trace("sds already exists\n");
++		goto out;
++	}
++
++	if (ntfs_sd_next_entry(vol, &id, &offset))
++		goto out;
++
++	sd_length = sid_length + sizeof(SECURITY_DESCRIPTOR_HEADER);
++	sd = ntfs_calloc(sd_length);
++	if (!sd)
++		goto out;
++
++	sd->hash          = ntfs_security_hash(sid, sid_length);
++	sd->security_id   = cpu_to_le32(id);
++	sd->offset        = cpu_to_le64(offset);
++	sd->length        = cpu_to_le32(sd_length);
++	memcpy(&sd->sid, sid, sid_length);
++
++	if (ntfs_sd_write(vol, sd))
++		goto fail;
++
++	if (ntfs_sd_add_hash(vol, sd))
++		goto fail;
++
++	if (ntfs_sd_add_id(vol, sd))
++		goto fail;
++
++ out:
++	return sd;
++
++ fail:
++	free(sd);
++	sd = NULL;
++	goto out;
++}

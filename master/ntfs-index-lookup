@@ -1,0 +1,41 @@
+diff --git a/include/ntfs/index.h b/include/ntfs/index.h
+index 75e23e2..14be05c 100644
+--- a/include/ntfs/index.h
++++ b/include/ntfs/index.h
+@@ -90,6 +90,7 @@ typedef struct {
+ 	INDEX_ENTRY *entry;
+ 	void *data;
+ 	u16 data_len;
++	ATTR_TYPES type;
+ 	COLLATION_RULES cr;
+ 	BOOL is_in_root;
+ 	INDEX_ROOT *ir;
+diff --git a/libntfs/index.c b/libntfs/index.c
+index 5e5760b..4d7177a 100644
+--- a/libntfs/index.c
++++ b/libntfs/index.c
+@@ -680,6 +680,8 @@ int ntfs_index_lookup(const void *key, const int key_len,
+ 		return -1;
+ 	}
+ 
++	icx->type = ir->type;
++
+ 	icx->block_size = le32_to_cpu(ir->index_block_size);
+ 	if (icx->block_size < NTFS_BLOCK_SIZE) {
+ 		errno = EINVAL;
+@@ -783,8 +785,13 @@ err_out:
+ 	return -1;
+ done:
+ 	icx->entry = ie;
+-	icx->data = (u8 *)ie + offsetof(INDEX_ENTRY, key);
+-	icx->data_len = le16_to_cpu(ie->key_length);
++	if (icx->type == AT_FILE_NAME) {
++		icx->data = (u8 *)ie + offsetof(INDEX_ENTRY, key);
++		icx->data_len = le16_to_cpu(ie->key_length);
++	} else {
++		icx->data = (u8 *)ie + le16_to_cpu(ie->data_offset);
++		icx->data_len = le16_to_cpu(ie->data_length);
++	}
+ 	icx->max_depth = icx->pindex;
+ 	ntfs_log_trace("Done.\n");
+ 	if (err) {

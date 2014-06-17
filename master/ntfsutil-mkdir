@@ -1,0 +1,385 @@
+diff --git a/ntfsprogs/Makefile.am b/ntfsprogs/Makefile.am
+index 40365c1..4b68abb 100644
+--- a/ntfsprogs/Makefile.am
++++ b/ntfsprogs/Makefile.am
+@@ -101,7 +101,8 @@ ntfscmp_LDADD		= $(AM_LIBS)
+ ntfscmp_LDFLAGS		= $(AM_LFLAGS)
+ 
+ ntfsutil_SOURCES        = ntfsutil.c ntfsutil.h ntfsutil-lib.c ntfsutil-lib.h utils.c utils.h \
+-			  ntfsutil-rm.c
++			  ntfsutil-rm.c \
++			  ntfsutil-mkdir.c
+ ntfsutil_LDADD          = $(AM_LIBS)
+ ntfsutil_LDFLAGS        = $(AM_LFLAGS)
+ 
+diff --git a/ntfsprogs/ntfsutil-mkdir.c b/ntfsprogs/ntfsutil-mkdir.c
+new file mode 100644
+index 0000000..2791438
+--- /dev/null
++++ b/ntfsprogs/ntfsutil-mkdir.c
+@@ -0,0 +1,335 @@
++/*
++ * ntfsutil-mkdir
++ *
++ * This utility will create an empty directory.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program (in the main directory of the Linux-NTFS
++ * distribution in the file COPYING); if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include "config.h"
++
++#ifdef HAVE_STDIO_H
++#include <stdio.h>
++#endif
++#ifdef HAVE_GETOPT_H
++#include <getopt.h>
++#endif
++#ifdef HAVE_STDLIB_H
++#include <stdlib.h>
++#endif
++#ifdef HAVE_STRING_H
++#include <string.h>
++#endif
++#ifdef HAVE_SYS_STAT_H
++#include <sys/stat.h>
++#endif
++
++#include <libgen.h>
++
++#include "types.h"
++#include "attrib.h"
++#include "dir.h"
++#include "utils.h"
++#include "ntfsutil.h"
++#include "ntfsutil-lib.h"
++
++struct ntfsutil_mkdir_ctx {
++	struct ntfsutil_mkdir_options   opts;
++	struct ntfsutil_target          tgt;
++};
++
++/**
++ * usage - Print a list of the parameters to the program
++ *
++ * Print a list of the parameters and options for the program.
++ *
++ * Return:  none
++ */
++static void usage(const char *app)
++{
++	ntfs_log_info("\nUsage: %s [options] image:path\n\n"
++		"    -p, --parents              Make parent directories\n"
++		"    -F, --force-mount          Mount dirty vols\n"
++		"    -V, --version              Version information\n"
++		"    -h, --help                 Print this help\n"
++		"    --log-{progress,quiet,verbose,trace,debug}\n\n", app);
++}
++
++/**
++ * parse_options - Read and validate the programs command line
++ *
++ * Read the command line, verify the syntax and parse the options.
++ * This function is very long, but quite simple.
++ *
++ * returns 0 if application should proceed, 1 otherwise, errno set on failure
++ */
++static int parse_options(struct ntfsutil_mkdir_options *opts,
++			 int argc, char **argv)
++{
++	static const char *sopt = "-pFVh?";
++	static const struct option lopt[] = {
++		{ "parents",        no_argument,        NULL, 'p' },
++		{ "force-mount",    no_argument,	NULL, 'F' },
++		{ "version",	    no_argument,	NULL, 'V' },
++		{ "help",	    no_argument,	NULL, 'h' },
++		{ NULL,		    0,			NULL, 0   }
++	};
++
++	int c, err, help, version;
++
++	err     = 0;
++	help    = 0;
++	version = 0;
++
++	optind  = 0;
++	opterr  = 0;
++
++	while ((c = getopt_long(argc, argv, sopt, lopt, NULL)) != -1) {
++		switch (c) {
++		case 1:	/* A non-option argument */
++			if (!opts->tgt)
++				opts->tgt = argv[optind - 1];
++			else {
++				ntfs_log_error("You must specify exactly one "
++					       "path.\n");
++				err = 1;
++			}
++			break;
++		case 'p':
++			opts->parents = 1;
++			break;
++		case 'F':
++			opts->force_mount = 1;
++			break;
++		case 'V':
++			version++;
++			break;
++		case 'h':
++		case '?':
++			if (strncmp(argv[optind-1], "--log-", 6) == 0) {
++				if (!strcmp(argv[optind - 1], "--log-progress"))
++					ntfs_log_set_levels(NTFS_LOG_LEVEL_PROGRESS);
++				else if (!ntfs_log_parse_option(argv[optind-1]))
++					err = 1;
++				break;
++			}
++			help++;
++			break;
++		default:
++			ntfs_log_error("Unknown option '%s'.\n", argv[optind-1]);
++			err = 1;
++			break;
++		}
++	}
++
++	if (!help && !version) {
++		if (!opts->tgt) {
++			ntfs_log_error("You must specify a device.\n");
++			err = 1;
++		}
++	}
++
++	if (help || version || err) {
++		ntfs_log_set_levels(NTFS_LOG_LEVEL_VERBOSE);
++		if (version)
++			ntfsutil_version();
++		if (help || err)
++			usage(argv[0]);
++		errno = (err ? EINVAL : 0);
++		err = 1;
++	}
++
++	return err;
++}
++
++static int
++ntfsutil_path_exists(ntfs_volume *vol, const char *path)
++{
++	u64 ino;
++
++	ino = ntfs_pathname_to_inode_num(vol, NULL, path);
++	if (ino == (u64)-1) {
++		if (errno == ENOENT)
++			return 0;
++		return -1;
++	}
++
++	return 1;
++}
++
++static int
++ntfsutil_create_directory(struct ntfsutil_mkdir_ctx *ctx, const char *directory)
++{
++	char *dir, *base;
++	ntfschar *un_name;
++	int ret, un_name_len;
++	ntfs_inode *dir_ni, *ni;
++
++	ret     = 1;
++	dir     = NULL;
++	base    = NULL;
++	un_name = NULL;
++	dir_ni  = NULL;
++	ni      = NULL;
++
++	ntfs_log_trace("Entering for path %s\n", directory);
++
++	if (ntfsutil_path_exists(ctx->tgt.vol, directory)) {
++		if (ctx->opts.parents)
++			goto done;
++
++		errno = EEXIST;
++		ntfs_log_perror("path already exists");
++		goto out;
++	}
++
++	if (ntfsutil_path_split(directory, &dir, &base)) {
++		ntfs_log_perror("parsing directory");
++		goto out;
++	}
++
++	un_name_len = ntfs_mbstoucs(base, &un_name, 0);
++	if (un_name_len < 0) {
++		un_name = NULL;
++		ntfs_log_perror("converting name to unicode");
++		goto out;
++	}
++
++	dir_ni = ntfs_pathname_to_inode(ctx->tgt.vol, NULL, dir);
++	if (!dir_ni) {
++		ntfs_log_error("%s does not exist\n", dir);
++		goto out;
++	}
++
++	ni = ntfs_create(dir_ni, un_name, un_name_len, S_IFDIR);
++	if (!ni) {
++		ntfs_log_perror("creating directory");
++		goto out;
++	}
++
++done:
++	ret = 0;
++out:
++	free(dir);
++	free(base);
++	free(un_name);
++	if (dir_ni)
++		ntfs_inode_close(dir_ni);
++	if (ni)
++		ntfs_inode_close(ni);
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++/**
++ * ntfsutil_mkdir() - create ntfs directory
++ *
++ * returns 0 on success or 1 on failure with errno set
++ */
++int
++_ntfsutil_mkdir(struct ntfsutil_mkdir_options *opts)
++{
++	char *copy;
++	int ret, flags;
++	struct ntfsutil_mkdir_ctx ctx;
++
++	ret          = 1;
++	copy         = NULL;
++
++	memset(&ctx, 0, sizeof(ctx));
++	memcpy(&ctx, opts, sizeof(*opts));
++
++	ntfs_log_trace("Entering.\n");
++
++	if (ntfsutil_parse_target(ctx.opts.tgt, &ctx.tgt)) {
++		ntfs_log_error("failed parsing target %s\n", ctx.opts.tgt);
++		goto out;
++	}
++
++	if (!ctx.tgt.image || !ctx.tgt.path) {
++		errno = EINVAL;
++		ntfs_log_perror("target must have from image:path");
++		goto out;
++	}
++
++	flags = (ctx.opts.force_mount ? NTFS_MNT_FORCE : 0);
++	ctx.tgt.vol = utils_mount_volume(ctx.tgt.image, flags);
++	if (!ctx.tgt.vol) {
++		ntfs_log_perror("opening volume");
++		goto out;
++	}
++
++	if (!ctx.opts.parents)
++		ret = ntfsutil_create_directory(&ctx, ctx.tgt.path);
++	else {
++		char *p;
++
++		copy = ntfsutil_strdup(ctx.tgt.path);
++		if (!copy)
++			goto out;
++
++		p = copy;
++
++		do {
++			p = strchr(++p, '/');
++			if (p)
++				*p = '\0';
++
++			ret = ntfsutil_create_directory(&ctx, copy);
++			if (ret)
++				goto out;
++
++			if (p)
++				*p = '/';
++
++		} while (p && p[1] != '\0');
++	}
++
++out:
++	free(copy);
++	if (ctx.tgt.vol)
++		ntfs_umount(ctx.tgt.vol, FALSE);
++	free(ctx.tgt.image);
++	free(ctx.tgt.path);
++
++	ntfs_log_trace("Done.\n");
++	return ret;
++}
++
++
++/**
++ * ntfsutil_mkdir() - parse command line options and return _ntfsutil_mkdir()
++ */
++int
++ntfsutil_mkdir(int argc, char *argv[])
++{
++	int ret;
++	struct ntfsutil_mkdir_options opts;
++
++	ret = 1;
++	memset(&opts, 0, sizeof(opts));
++
++	if (parse_options(&opts, argc, argv)) {
++		if (!errno)
++			ret = 0;
++		goto out;
++	}
++
++	ret = _ntfsutil_mkdir(&opts);
++
++out:
++	return ret;
++}
+diff --git a/ntfsprogs/ntfsutil.c b/ntfsprogs/ntfsutil.c
+index e459b6e..e799d11 100644
+--- a/ntfsprogs/ntfsutil.c
++++ b/ntfsprogs/ntfsutil.c
+@@ -49,6 +49,7 @@ struct command {
+ 
+ static struct command commands[] = {
+ 	{ .name = "rm",        .func = ntfsutil_rm },
++	{ .name = "mkdir",     .func = ntfsutil_mkdir },
+ };
+ 
+ /**
+diff --git a/ntfsprogs/ntfsutil.h b/ntfsprogs/ntfsutil.h
+index e8162dd..75cd7c1 100644
+--- a/ntfsprogs/ntfsutil.h
++++ b/ntfsprogs/ntfsutil.h
+@@ -36,4 +36,13 @@ struct ntfsutil_rm_options {
+ int ntfsutil_rm(int, char **);
+ int _ntfsutil_rm(struct ntfsutil_rm_options *);
+ 
++struct ntfsutil_mkdir_options {
++        char                        *tgt;         /* Device/File to work with */
++        int                          parents;     /* Create parent directories */
++        int                          force_mount; /* Mount dirty volumes */
++};
++
++int ntfsutil_mkdir(int, char **);
++int _ntfsutil_mkdir(struct ntfsutil_mkdir_options *);
++
+ #endif /* _NTFSUTIL_H_ */

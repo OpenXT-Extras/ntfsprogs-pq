@@ -1,0 +1,180 @@
+diff --git a/include/ntfs/volume.h b/include/ntfs/volume.h
+index 015c6ac..4c87413 100644
+--- a/include/ntfs/volume.h
++++ b/include/ntfs/volume.h
+@@ -244,4 +244,7 @@ extern int ntfs_logfile_reset(ntfs_volume *vol);
+ 
+ extern int ntfs_volume_write_flags(ntfs_volume *vol, const le16 flags);
+ 
++extern int ntfs_volume_check_hiberfile(ntfs_volume *vol);
++extern int ntfs_volume_check_logfile(ntfs_volume *vol);
++
+ #endif /* defined _NTFS_VOLUME_H */
+diff --git a/libntfs/volume.c b/libntfs/volume.c
+index 00f4e40..fc0fd34 100644
+--- a/libntfs/volume.c
++++ b/libntfs/volume.c
+@@ -629,7 +629,7 @@ error_exit:
+  *
+  * Return 0 on success and -1 on error with errno set error code.
+  */
+-static int ntfs_volume_check_logfile(ntfs_volume *vol)
++int ntfs_volume_check_logfile(ntfs_volume *vol)
+ {
+ 	ntfs_inode *ni;
+ 	ntfs_attr *na = NULL;
+@@ -722,7 +722,7 @@ out:
+  * Return:  0 if Windows isn't hibernated for sure
+  *         -1 otherwise and errno is set to the appropriate value
+  */
+-static int ntfs_volume_check_hiberfile(ntfs_volume *vol)
++int ntfs_volume_check_hiberfile(ntfs_volume *vol)
+ {
+ 	ntfs_inode *ni;
+ 	ntfs_attr *na = NULL;
+diff --git a/ntfsprogs/ntfsutil-dump.c b/ntfsprogs/ntfsutil-dump.c
+index 2eaa765..8ab3ef8 100644
+--- a/ntfsprogs/ntfsutil-dump.c
++++ b/ntfsprogs/ntfsutil-dump.c
+@@ -58,6 +58,7 @@ struct ntfsutil_dump_ctx {
+ static void usage(const char *app)
+ {
+ 	ntfs_log_info("\nUsage: %s [options] image[:file]\n\n"
++		"    -s, --status               Dump volume status\n"
+ 		"    -m, --mrec                 Dump mrec info\n"
+ 		"    -d, --dirents              Dump directory entries\n"
+ 		"    -i, --inode                Inumber to dump\n"
+@@ -78,8 +79,9 @@ static void usage(const char *app)
+ static int parse_options(struct ntfsutil_dump_options *opts,
+ 			 int argc, char **argv)
+ {
+-	static const char *sopt = "-mdi:FVh?";
++	static const char *sopt = "-smdi:FVh?";
+ 	static const struct option lopt[] = {
++		{ "status",         no_argument,        NULL, 's' },
+ 		{ "mrec",	    no_argument,	NULL, 'm' },
+ 		{ "dirents",	    no_argument,	NULL, 'd' },
+ 		{ "inode",	    required_argument,	NULL, 'i' },
+@@ -113,6 +115,9 @@ static int parse_options(struct ntfsutil_dump_options *opts,
+ 				err = 1;
+ 			}
+ 			break;
++		case 's':
++			opts->status = 1;
++			break;
+ 		case 'm':
+ 			opts->mrec = 1;
+ 			break;
+@@ -157,9 +162,9 @@ static int parse_options(struct ntfsutil_dump_options *opts,
+ 			ntfs_log_error("You must specify a device.\n");
+ 			err = 1;
+ 		}
+-		if (!opts->mrec && !opts->dirents) {
++		if (!opts->mrec && !opts->dirents && !opts->status) {
+ 			ntfs_log_error("You must specify an operation "
+-				       "(--mrec or --dirents)\n");
++				       "(--status, --mrec, or --dirents)\n");
+ 			err = 1;
+ 		}
+ 	}
+@@ -385,6 +390,35 @@ ntfsutil_dump_mrec(struct ntfsutil_dump_ctx *ctx, ntfs_inode *inode)
+ 	return 0;
+ }
+ 
++static void
++ntfsutil_dump_status(struct ntfsutil_dump_ctx *ctx)
++{
++	ntfs_volume *vol = ctx->tgt.vol;
++
++	if (NVolWasDirty(vol)) {
++		printf("volume is dirty\n");
++		goto out;
++	}
++
++	if (ntfs_volume_check_hiberfile(vol)) {
++		printf("volume is hibernated\n");
++		goto out;
++	}
++
++	if (ntfs_volume_check_logfile(vol)) {
++		if (errno == EOPNOTSUPP)
++			printf("dirty $LogFile\n");
++		else
++			ntfs_log_perror("checking logfile\n");
++		goto out;
++	}
++
++	printf("volume is clean\n");
++
++out:
++	return;
++}
++
+ int
+ _ntfsutil_dump(struct ntfsutil_dump_options *opts)
+ {
+@@ -410,14 +444,17 @@ _ntfsutil_dump(struct ntfsutil_dump_options *opts)
+ 		goto out;
+ 	}
+ 
+-	if ((ctx.opts.inode == -1 && !ctx.tgt.path) ||
+-	    (ctx.opts.inode != -1 &&  ctx.tgt.path)) {
+-		errno = EINVAL;
+-		ntfs_log_perror("you must supply only one ino or target path");
+-		goto out;
++	if (!ctx.opts.status) {
++		if ((ctx.opts.inode == -1 && !ctx.tgt.path) ||
++		    (ctx.opts.inode != -1 &&  ctx.tgt.path)) {
++			errno = EINVAL;
++			ntfs_log_perror("you must supply only "
++					"one ino or target path");
++			goto out;
++		}
+ 	}
+ 
+-	flags = NTFS_MNT_RDONLY;
++	flags = NTFS_MNT_RDONLY | NTFS_MNT_FORENSIC;
+ 	if (ctx.opts.force_mount)
+ 		flags |= NTFS_MNT_FORCE;
+ 	ctx.tgt.vol = utils_mount_volume(ctx.tgt.image, flags);
+@@ -440,7 +477,7 @@ _ntfsutil_dump(struct ntfsutil_dump_options *opts)
+ 						ctx.opts.inode);
+ 			goto out;
+ 		}
+-	} else {
++	} else if (ctx.tgt.path) {
+ 		inode = ntfs_pathname_to_inode(ctx.tgt.vol, NULL, ctx.tgt.path);
+ 		if (!inode) {
+ 			ntfs_log_perror("opening %s", ctx.tgt.path);
+@@ -448,14 +485,17 @@ _ntfsutil_dump(struct ntfsutil_dump_options *opts)
+ 		}
+ 	}
+ 
+-	if (ctx.opts.dirents)
++	if (ctx.opts.dirents && inode)
+ 		if (ntfsutil_dump_dir(&ctx, inode))
+ 			goto out;
+ 
+-	if (ctx.opts.mrec)
++	if (ctx.opts.mrec && inode)
+ 		if (ntfsutil_dump_mrec(&ctx, inode))
+ 			goto out;
+ 
++	if (ctx.opts.status)
++		ntfsutil_dump_status(&ctx);
++
+ 	ret = 0;
+ 
+ out:
+diff --git a/ntfsprogs/ntfsutil.h b/ntfsprogs/ntfsutil.h
+index 2913e09..e01d54c 100644
+--- a/ntfsprogs/ntfsutil.h
++++ b/ntfsprogs/ntfsutil.h
+@@ -60,6 +60,7 @@ struct ntfsutil_dump_options {
+ 	s64                          inode;       /* Inode number to dump */
+ 	int                          mrec;        /* Dump mrec info */
+ 	int                          dirents;     /* Dump directory entries */
++	int                          status;      /* Dump volume status */
+ 	int		             force_mount; /* Override common sense */
+ };
+ 

@@ -1,0 +1,39 @@
+diff --git a/libntfs/attrib.c b/libntfs/attrib.c
+index a1fe954..54dbd36 100644
+--- a/libntfs/attrib.c
++++ b/libntfs/attrib.c
+@@ -1202,7 +1202,8 @@ s64 ntfs_attr_pwrite(ntfs_attr *na, const s64 pos, s64 count, const void *b)
+ 		if (rl->lcn < (LCN)0) {
+ 			LCN lcn_seek_from = -1;
+ 			runlist *rlc;
+-			VCN cur_vcn, from_vcn;
++			VCN cur_vcn, new_vcn, from_vcn;
++			s64 new_ofs;
+ 
+ 			if (rl->lcn != (LCN)LCN_HOLE) {
+ 				errno = EIO;
+@@ -1276,6 +1277,8 @@ s64 ntfs_attr_pwrite(ntfs_attr *na, const s64 pos, s64 count, const void *b)
+ 				errno = eo;
+ 				goto err_out;
+ 			}
++			new_vcn = rlc->vcn;
++			new_ofs = pos + total - (new_vcn << vol->cluster_size_bits);
+ 			/* Merge runlists. */
+ 			rl = ntfs_runlists_merge(na->rl, rlc);
+ 			if (!rl) {
+@@ -1335,11 +1338,11 @@ s64 ntfs_attr_pwrite(ntfs_attr *na, const s64 pos, s64 count, const void *b)
+ 					vol->cluster_size_bits;
+ 			}
+ 			/*
+-			 * Clear region between start of @rl->vcn cluster and
+-			 * @ofs if necessary.
++			 * Clear region between start of new vcn cluster and
++			 * @new_ofs if necessary.
+ 			 */
+-			if (ofs && ntfs_rl_fill_zero(vol, na->rl, rl->vcn <<
+-					vol->cluster_size_bits, ofs))
++			if (new_ofs && ntfs_rl_fill_zero(vol, na->rl, new_vcn <<
++					vol->cluster_size_bits, new_ofs))
+ 				goto err_out;
+ 		}
+ 		/* It is a real lcn, write it to the volume. */

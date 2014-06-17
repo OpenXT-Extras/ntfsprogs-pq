@@ -1,0 +1,55 @@
+diff --git a/include/ntfs/dir.h b/include/ntfs/dir.h
+index 5299861..615bff2 100644
+--- a/include/ntfs/dir.h
++++ b/include/ntfs/dir.h
+@@ -109,4 +109,6 @@ typedef int (*ntfs_filldir_t)(void *dirent, const ntfschar *name,
+ extern int ntfs_readdir(ntfs_inode *dir_ni, s64 *pos,
+ 		void *dirent, ntfs_filldir_t filldir);
+ 
++extern int ntfs_check_empty_dir(ntfs_inode *ni);
++
+ #endif /* defined _NTFS_DIR_H */
+diff --git a/libntfs/dir.c b/libntfs/dir.c
+index 85e9c0d..58cbf1d 100644
+--- a/libntfs/dir.c
++++ b/libntfs/dir.c
+@@ -1424,6 +1424,39 @@ ntfs_inode *ntfs_create_symlink(ntfs_inode *dir_ni, ntfschar *name, u8 name_len,
+ 	return __ntfs_create(dir_ni, name, name_len, S_IFLNK, 0,
+ 			target, target_len);
+ }
++ 
++/**
++ * adapted from libntfs-3g
++ */
++int
++ntfs_check_empty_dir(ntfs_inode *ni)
++{
++	ntfs_attr *na;
++	int ret = 0;
++
++	if (!(ni->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	na = ntfs_attr_open(ni, AT_INDEX_ROOT, NTFS_INDEX_I30, 4);
++	if (!na) {
++		errno = EIO;
++		ntfs_log_perror("Failed to open directory");
++		return -1;
++	}
++
++	/* Non-empty directory? */
++	if ((na->data_size != sizeof(INDEX_ROOT) + sizeof(INDEX_ENTRY_HEADER))){
++		/* Both ENOTEMPTY and EEXIST are ok. We use the more common. */
++		errno = ENOTEMPTY;
++		ntfs_log_debug("Directory is not empty\n");
++		ret = -1;
++	}
++
++	ntfs_attr_close(na);
++	return ret;
++}
+ 
+ /**
+  * ntfs_delete - delete file or directory from ntfs volume
